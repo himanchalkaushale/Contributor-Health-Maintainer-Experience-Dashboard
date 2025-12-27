@@ -1,0 +1,114 @@
+Contributor Health & Maintainer Experience Dashboard
+Improved Implementation Plan
+
+OVERVIEW
+This project aims to build a lightweight, signal-driven dashboard that helps open-source
+maintainers identify early warning signs of contributor friction such as delayed pull-request
+reviews, unanswered issues, and declining contributor engagement. The system focuses on
+actionable health signals rather than raw metrics, enabling maintainers to intervene before
+problems become critical.
+
+ARCHITECTURE
+GitHub API
+  -> Data Collector (Python)
+  -> Database (SQLite / PostgreSQL)
+  -> Health Signal Engine
+  -> FastAPI REST API
+  -> React Dashboard
+
+The architecture enforces a clear separation of concerns between data collection,
+signal computation, API exposure, and visualization.
+
+CORE FEATURES
+- GitHub API client with authentication, pagination, and rate-limit handling
+- Historical data collection for PRs, issues, commits, and reviews
+- Deterministic health signal computation with severity levels
+- REST API exposing structured signal data
+- Maintainer-focused UI with clear severity indicators
+
+HEALTH SIGNALS
+
+Core Signals (Guaranteed Deliverables)
+1. Stale Pull Requests
+   - Warning: No review for more than 7 days
+   - Critical: No review for more than 14 days
+
+2. Unanswered Issues
+   - Issues without maintainer response beyond a configurable threshold
+
+3. First-Time Contributor Response Time
+   - Time to first maintainer interaction on a contributor’s first PR
+
+4. Repository Activity Trends
+   - Weekly commit, pull request, and issue activity trends
+
+Stretch Signals (If Time Permits)
+5. Contributor Churn
+   - Contributors inactive after their first contribution
+
+6. Review Bottlenecks
+   - PRs blocked waiting on specific reviewers
+
+BACKEND COMPONENTS
+backend/
+  app/
+    main.py              FastAPI application entry
+    config.py            Configuration and environment variables
+    database.py          SQLAlchemy setup
+    models/              Database models
+    services/
+      github_client.py   GitHub API integration
+      data_collector.py  Data ingestion logic
+      signal_engine.py   Health signal computation
+    api/                 REST API endpoints
+    schemas/             Pydantic response models
+
+Signal Engine Responsibilities
+- Consume normalized database entities
+- Apply deterministic rules to compute health signals
+- Assign severity levels (healthy, warning, critical)
+- Produce structured outputs for API consumption
+
+Each signal defines:
+- Input data
+- Threshold logic
+- Severity criteria
+- Output schema
+
+FRONTEND COMPONENTS
+The frontend is responsible for explaining signals, not computing them.
+
+- Clear severity badges (green, yellow, red)
+- Minimal and focused charts
+- Dedicated pages for overview, contributors, PR bottlenecks, and issues
+- Responsive layout
+
+VERIFICATION PLAN
+
+Automated Verification
+- Unit tests for signal logic and severity classification
+- API response schema validation
+- Basic frontend component rendering tests
+
+Manual Verification
+- Cross-check computed signals against GitHub web UI
+- Validate severity changes by adjusting thresholds
+- Test behavior on low-activity and high-activity repositories
+
+DEMO AND DEPLOYMENT STRATEGY
+- Local development using SQLite
+- PostgreSQL support for production deployments
+- Optional hosted PostgreSQL (e.g., Supabase) for read-only demo
+- Public GitHub repository used as demo data source
+- Screenshots and short screen recordings included
+
+DOCUMENTATION
+- README.md with setup instructions and architecture overview
+- Environment variable template (.env.example)
+- Self-hosted deployment instructions
+
+WHY THIS PLAN IS STRONG
+- Clear separation between core and stretch scope
+- Reduced risk of overcommitment
+- Explicit signal definitions
+- High confidence in completion within a 12-week GSoC timeline
