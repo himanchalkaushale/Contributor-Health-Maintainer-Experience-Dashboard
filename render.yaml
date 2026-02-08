@@ -1,0 +1,28 @@
+services:
+  # Backend API
+  - type: web
+    name: contributor-health-api
+    runtime: python
+    buildCommand: "pip install -r backend/requirements.txt"
+    startCommand: "cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        value: sqlite:///./sql_app.db
+    disk:
+      name: data
+      mountPath: /opt/render/project/src/backend
+      sizeGB: 1
+
+  # Frontend
+  - type: web
+    name: contributor-health-frontend
+    runtime: node
+    buildCommand: "cd frontend && npm install && npm run build"
+    startCommand: "cd frontend && npm run preview -- --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: VITE_API_URL
+        value: https://contributor-health-api.onrender.com
