@@ -1,0 +1,21 @@
+# Railway Monorepo Configuration
+# This tells Railway we have multiple services in one repo
+
+[build]
+builder = "NIXPACKS"
+
+# Backend service configuration
+[[services]]
+name = "backend"
+source = "backend"
+
+[services.build]
+nixpacksConfigPath = "backend/nixpacks.toml"
+
+# Frontend service configuration  
+[[services]]
+name = "frontend"
+source = "frontend"
+
+[services.build]
+nixpacksConfigPath = "frontend/nixpacks.toml"
