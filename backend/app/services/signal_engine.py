@@ -458,6 +458,118 @@ class SignalEngine:
             import traceback
             traceback.print_exc()
             print(f"ERROR calculating Issues health: {e}")
+            print(f"ERROR calculating Issues health: {e}")
+            return None
+
+    def compute_pr_review_health(self, repo_id: int) -> Dict[str, Any]:
+        """
+        Calculates PR Review Health metrics:
+        1. Open PRs
+        2. Unreviewed PRs (Open & has_review=False)
+        3. PRs Waiting > 7 Days
+        4. Median Review Time
+        5. Attention Queue (Table of critical PRs)
+        6. Review Flow Insight
+        """
+        now = datetime.utcnow()
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        try:
+            # --- 1. Basic Counts ---
+            open_prs = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.state == 'open'
+            ).all()
+            open_prs_count = len(open_prs)
+
+            # --- 2. Unreviewed PRs (The Risk Metric) ---
+            # Proxy: Open AND has_review is False
+            unreviewed_prs = [pr for pr in open_prs if not pr.has_review]
+            unreviewed_count = len(unreviewed_prs)
+
+            # --- 3. Waiting > 7 Days ---
+            seven_days_ago = now - timedelta(days=7)
+            waiting_over_7d = [pr for pr in open_prs if pr.created_at < seven_days_ago]
+            waiting_over_7d_count = len(waiting_over_7d)
+
+            # --- 4. Median Review Time ---
+            ninety_days_ago = now - timedelta(days=90)
+            reviewed_prs_90d = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.time_to_first_review != None,
+                PullRequest.created_at >= ninety_days_ago
+            ).all()
+            
+            review_times = [pr.time_to_first_review for pr in reviewed_prs_90d]
+            median_review_hours = statistics.median(review_times) if review_times else None
+
+            # --- 5. Attention Queue (The Action Table) ---
+            # Unified list: Unreviewed first, then by age.
+            attention_queue = []
+            
+            for pr in open_prs:
+                age_days = (now - pr.created_at).days
+                is_unreviewed = not pr.has_review
+                
+                # Status Logic
+                status = 'healthy'
+                if is_unreviewed:
+                    if age_days > 7: status = 'critical'
+                    else: status = 'warning' # Unreviewed is always at least a warning in this view? Or just heavily weighted.
+                    # Let's stick to Age-based status for consistency, but Unreviewed is the sort key.
+                else:
+                    if age_days > 14: status = 'critical'
+                    elif age_days > 7: status = 'warning'
+
+                # Last Activity Proxy
+                last_activity = 'None' if is_unreviewed else 'Maintainer' # Simplification based on has_review
+
+                attention_queue.append({
+                    "number": pr.number,
+                    "title": pr.title,
+                    "author": pr.author.login if pr.author else "unknown",
+                    "age_days": age_days,
+                    "last_activity": last_activity,
+                    "status": status,
+                    "is_unreviewed": is_unreviewed,
+                    "html_url": f"https://github.com/{repo.owner}/{repo.name}/pull/{pr.number}"
+                })
+
+            # Sort: Unreviewed First (True > False), then Age Descending
+            attention_queue.sort(key=lambda x: (not x['is_unreviewed'], -x['age_days'])) # False < True, so not True (False) comes first? 
+            # Wait, True > False is 1 > 0. Descending sort puts True first. 
+            # Start with explicit tuple sort:
+            # Primary: is_unreviewed (True first) -> Reverse
+            # Secondary: age_days (High first) -> Reverse
+            attention_queue.sort(key=lambda x: (x['is_unreviewed'], x['age_days']), reverse=True)
+            
+            # --- 6. Review Flow Insight ---
+            # Simple breakdown
+            waiting_for_first_review = unreviewed_count # Roughly same concept for this page
+            # "Near Merge" is hard to guess without CI status. 
+            # Let's use: Reviewed but not merged
+            reviewed_open = open_prs_count - unreviewed_count
+            
+            return {
+                "summary": {
+                    "open_prs": open_prs_count,
+                    "unreviewed_prs": unreviewed_count,
+                    "waiting_over_7d": waiting_over_7d_count,
+                    "median_review_hours": round(median_review_hours, 1) if median_review_hours is not None else None
+                },
+                "attention_queue": attention_queue,
+                "review_flow": {
+                    "waiting_for_first_review": waiting_for_first_review,
+                    "in_review_process": reviewed_open
+                }
+            }
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"ERROR calculating PR Review Health: {e}")
             return None
 
     def compute_repo_signals(self, repo_id: int) -> List[Dict[str, Any]]:

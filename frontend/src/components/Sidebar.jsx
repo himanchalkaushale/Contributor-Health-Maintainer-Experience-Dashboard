@@ -12,7 +12,7 @@ const Sidebar = () => {
     const navItems = [
         { to: "/", label: "Dashboard", icon: LayoutDashboard },
         { to: "/contributors", label: "Contributors", icon: Users },
-        { to: "/pr-bottlenecks", label: "PR Bottlenecks", icon: GitPullRequest },
+        { to: "/pr-review-health", label: "PR Review Health", icon: GitPullRequest },
         { to: "/issues", label: "Issues", icon: AlertCircle },
     ];
 

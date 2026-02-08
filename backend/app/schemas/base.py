@@ -14,6 +14,11 @@ class RepositoryResponse(BaseModel):
     url: str
     last_synced_at: Optional[datetime]
     
+    # Sync Progress
+    sync_status: str = "completed"
+    sync_item_count: int = 0
+    sync_total_items: int = 0
+    
     class Config:
         from_attributes = True
 

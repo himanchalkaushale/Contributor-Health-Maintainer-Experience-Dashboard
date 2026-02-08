@@ -1,8 +1,8 @@
-import httpx
+import requests
+import asyncio
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
-import asyncio
+from datetime import datetime
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -13,33 +13,32 @@ class GitHubClient:
         self.base_url = "https://api.github.com"
         self.headers = {
             "Accept": "application/vnd.github.v3+json",
-            "Authorization": f"token {settings.GITHUB_TOKEN}" if settings.GITHUB_TOKEN else ""
+            "Authorization": f"Bearer {settings.GITHUB_TOKEN}" if settings.GITHUB_TOKEN else ""
         }
         if not settings.GITHUB_TOKEN:
             logger.warning("No GitHub token provided. Rate limits will be restricted.")
             
     async def _request(self, method: str, endpoint: str, params: Dict = None) -> Any:
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.request(
+        def sync_request():
+            # Use a session for connection pooling
+            with requests.Session() as session:
+                response = session.request(
                     method, 
                     f"{self.base_url}{endpoint}", 
                     headers=self.headers,
-                    params=params
+                    params=params,
+                    timeout=30
                 )
-                
-                # Handle rate limits
-                if response.status_code == 403 and "rate limit" in response.text.lower():
-                    reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
-                    wait_seconds = max(0, reset_time - datetime.now().timestamp())
-                    logger.error(f"Rate limit exceeded. Reset in {wait_seconds} seconds")
-                    raise Exception(f"GitHub API rate limit exceeded. Reset in {wait_seconds} seconds")
-                
                 response.raise_for_status()
                 return response.json()
-            except httpx.HTTPError as e:
-                logger.error(f"GitHub API error: {str(e)}")
-                raise
+
+        try:
+            return await asyncio.to_thread(sync_request)
+        except requests.RequestException as e:
+            import traceback
+            traceback.print_exc()
+            logger.error(f"GitHub API error: {e}")
+            raise Exception(f"GitHub API error: {e}")
 
     async def get_repository(self, owner: str, repo: str) -> Dict:
         return await self._request("GET", f"/repos/{owner}/{repo}")

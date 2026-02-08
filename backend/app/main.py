@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api import endpoints
 from app.database import engine, Base
+from sqlalchemy import text
 from app.config import get_settings
 
 settings = get_settings()
@@ -28,6 +29,10 @@ app.include_router(endpoints.router, prefix="/api")
 
 @app.on_event("startup")
 async def startup_event():
+    # Enable WAL Mode for concurrency
+    with engine.connect() as connection:
+        connection.execute(text("PRAGMA journal_mode=WAL;"))
+        print("✅ Database configured with WAL Mode")
     print("\n" + "="*50)
     print("📍 REGISTERED ROUTES:")
     for route in app.routes:

@@ -59,12 +59,42 @@ const TopHeader = () => {
                     </form>
                 </div>
 
-                {/* Sync Time */}
-                {lastSynced && (
-                    <div className="text-xs text-muted-foreground flex items-center gap-1.5 border-l pl-6">
-                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
-                        Last updated: {Math.floor((new Date() - lastSynced) / 60000)} min ago
+                {/* Sync Status Display */}
+                {selectedRepo?.sync_status === 'syncing' ? (
+                    <div className="flex flex-col w-48 gap-1 border-l pl-6">
+                        <div className="flex justify-between text-xs text-muted-foreground">
+                            <span>Syncing...</span>
+                            <span>{Math.round((selectedRepo.sync_item_count / (selectedRepo.sync_total_items || 1)) * 100)}%</span>
+                        </div>
+                        <div className="h-1.5 w-full bg-secondary rounded-full overflow-hidden">
+                            <div
+                                className="h-full bg-primary transition-all duration-500"
+                                style={{ width: `${(selectedRepo.sync_item_count / (selectedRepo.sync_total_items || 1)) * 100}%` }}
+                            />
+                        </div>
+                        <div className="text-[10px] text-muted-foreground text-right">
+                            {(() => {
+                                const total = selectedRepo.sync_total_items || 1;
+                                const current = selectedRepo.sync_item_count || 0;
+                                const elapsed = (new Date() - new Date(selectedRepo.last_synced_at)) / 1000; // seconds
+                                if (current === 0 || elapsed < 2) return "Calculating...";
+
+                                const rate = current / elapsed; // items per second
+                                const remaining = total - current;
+                                const estSeconds = remaining / rate;
+
+                                if (estSeconds < 60) return `${Math.ceil(estSeconds)}s remaining`;
+                                return `${Math.ceil(estSeconds / 60)}m remaining`;
+                            })()}
+                        </div>
                     </div>
+                ) : (
+                    lastSynced && (
+                        <div className="text-xs text-muted-foreground flex items-center gap-1.5 border-l pl-6">
+                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                            <span>Last updated: {Math.max(0, Math.floor((new Date() - lastSynced) / 60000))} min ago</span>
+                        </div>
+                    )
                 )}
             </div>
         </header>

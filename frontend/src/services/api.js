@@ -48,6 +48,20 @@ export const repoService = {
     getIssuesHealth: async (id) => {
         const response = await api.get(`/repositories/${id}/issues-health`);
         return response.data;
+    },
+
+    getPRReviewHealth: async (repoFullName) => {
+        const response = await api.get(`/health/pr-review?repo=${repoFullName}`);
+        return response.data;
+    },
+
+    generateNudge: async (prTitle, authorName, daysWaiting) => {
+        const response = await api.post('/nudge/generate', {
+            pr_title: prTitle,
+            author_name: authorName,
+            days_waiting: daysWaiting
+        });
+        return response.data;
     }
 };
 

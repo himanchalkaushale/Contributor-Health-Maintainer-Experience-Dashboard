@@ -7,7 +7,10 @@ from app.services.data_collector import DataCollector
 from app.services.signal_engine import SignalEngine
 from typing import List
 
+import logging
+
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 @router.post("/repositories/sync", response_model=RepositoryResponse)
 async def sync_repository(
@@ -18,12 +21,21 @@ async def sync_repository(
     """Trigger a sync for a repository"""
     collector = DataCollector(db)
     
-    # Check if we should sync immediately or background
     # For MVP we sync immediately to show results
     try:
-        repo = await collector.sync_repository(repo_in.owner, repo_in.name)
+        # Phase 1: Init Sync (Fast)
+        repo = await collector.init_sync(repo_in.owner, repo_in.name)
+        
+        # Phase 2: Background Processing (Slow)
+        # We need to pass a new instance of Collector or a static method to avoid DB session issues
+        # But for simplicity, we rely on execute_sync creating its own session.
+        # We pass the method from the current instance, but the method implementation 
+        # creates a NEW session, so it's safe.
+        background_tasks.add_task(collector.execute_sync, repo.id, repo_in.owner, repo_in.name)
+        
         return repo
     except Exception as e:
+        logger.error(f"Sync failed: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/repositories/{repo_id}/overview", response_model=OverviewResponse)
@@ -105,6 +117,8 @@ def get_pr_bottlenecks(repo_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Repository not found or data unavailable")
     return data
 
+    return data
+
 @router.get("/repositories/{repo_id}/issues-health")
 def get_issues_health(repo_id: int, db: Session = Depends(get_db)):
     engine = SignalEngine(db)
@@ -112,3 +126,45 @@ def get_issues_health(repo_id: int, db: Session = Depends(get_db)):
     if not data:
         raise HTTPException(status_code=404, detail="Repository not found or data unavailable")
     return data
+
+@router.get("/health/pr-review")
+def get_pr_review_health_by_query(repo: str, db: Session = Depends(get_db)):
+    """
+    Get PR Review Health metrics by repo name.
+    Query: /api/health/pr-review?repo=owner/repo
+    """
+    if "/" not in repo:
+        raise HTTPException(status_code=400, detail="Repository must be in format 'owner/name'")
+    
+    owner, name = repo.split("/", 1)
+    
+    repo_obj = db.query(Repository).filter(
+        Repository.owner == owner, 
+        Repository.name == name
+    ).first()
+    
+    if not repo_obj:
+        raise HTTPException(status_code=404, detail=f"Repository '{repo}' not found")
+
+    engine = SignalEngine(db)
+    data = engine.compute_pr_review_health(int(repo_obj.id))
+    
+    if not data:
+        raise HTTPException(status_code=404, detail="Data unavailable")
+        
+    return data
+
+from pydantic import BaseModel
+
+class NudgeRequest(BaseModel):
+    pr_title: str
+    author_name: str
+    days_waiting: int
+
+@router.post("/nudge/generate")
+async def generate_nudge(request: NudgeRequest):
+    """Generate a polite nudge message using Gemini"""
+    from app.services.gemini_service import GeminiService
+    service = GeminiService()
+    message = await service.generate_nudge(request.pr_title, request.author_name, request.days_waiting)
+    return {"message": message}

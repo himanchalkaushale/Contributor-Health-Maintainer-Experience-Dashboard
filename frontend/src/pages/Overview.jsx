@@ -5,7 +5,7 @@ import { useRepo } from '@/context/RepoContext';
 import { repoService } from '@/services/api';
 import { Users, GitPullRequest, Clock, AlertCircle, Loader2, Info } from 'lucide-react';
 import {
-    LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+    AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
     Legend
 } from 'recharts';
 
@@ -148,16 +148,87 @@ const Overview = () => {
                     </div>
                     <div className="h-[320px] w-full mt-6">
                         <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={chartData}>
-                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                                <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#94a3b8' }} dy={10} />
-                                <YAxis yAxisId="left" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#6366f1' }} label={{ value: 'PRs', angle: -90, position: 'insideLeft', fill: '#6366f1', fontSize: 10 }} />
-                                <YAxis yAxisId="right" orientation="right" axisLine={false} tickLine={false} tick={{ fontSize: 12, fill: '#94a3b8' }} label={{ value: 'Issues', angle: 90, position: 'insideRight', fill: '#94a3b8', fontSize: 10 }} />
-                                <Tooltip contentStyle={{ borderRadius: '6px', border: 'none', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }} />
+                            <AreaChart data={chartData} margin={{ top: 10, right: 0, left: -20, bottom: 0 }}>
+                                <defs>
+                                    <linearGradient id="colorPrs" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="5%" stopColor="#6366f1" stopOpacity={0.3} />
+                                        <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
+                                    </linearGradient>
+                                    <linearGradient id="colorIssues" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="5%" stopColor="#94a3b8" stopOpacity={0.3} />
+                                        <stop offset="95%" stopColor="#94a3b8" stopOpacity={0} />
+                                    </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" strokeOpacity={0.5} />
+                                <XAxis
+                                    dataKey="name"
+                                    axisLine={false}
+                                    tickLine={false}
+                                    tick={{ fontSize: 12, fill: '#94a3b8' }}
+                                    dy={10}
+                                />
+                                <YAxis
+                                    yAxisId="left"
+                                    axisLine={false}
+                                    tickLine={false}
+                                    tick={{ fontSize: 12, fill: '#6366f1' }}
+                                    label={{ value: 'PRs', angle: -90, position: 'insideLeft', fill: '#6366f1', fontSize: 10, dy: 40 }}
+                                />
+                                <YAxis
+                                    yAxisId="right"
+                                    orientation="right"
+                                    axisLine={false}
+                                    tickLine={false}
+                                    tick={{ fontSize: 12, fill: '#94a3b8' }}
+                                    label={{ value: 'Issues', angle: 90, position: 'insideRight', fill: '#94a3b8', fontSize: 10, dy: 40 }}
+                                />
+                                <Tooltip
+                                    content={({ active, payload, label }) => {
+                                        if (active && payload && payload.length) {
+                                            return (
+                                                <div className="bg-popover/95 backdrop-blur-sm border border-border p-3 rounded-lg shadow-xl text-xs">
+                                                    <p className="font-semibold text-foreground mb-2">{label}</p>
+                                                    {payload.map((entry, index) => (
+                                                        <div key={index} className="flex items-center gap-2 mb-1 last:mb-0">
+                                                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: entry.color }} />
+                                                            <span className="text-muted-foreground capitalize">{entry.name}:</span>
+                                                            <span className="font-medium text-foreground">{entry.value}</span>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            );
+                                        }
+                                        return null;
+                                    }}
+                                />
                                 <Legend iconType="circle" />
-                                {(chartView === 'all' || chartView === 'prs') && <Line yAxisId="left" name="PRs" type="monotone" dataKey="prs" stroke="#6366f1" strokeWidth={3} dot={{ r: 4 }} activeDot={{ r: 6 }} />}
-                                {(chartView === 'all' || chartView === 'issues') && <Line yAxisId="right" name="Issues" type="monotone" dataKey="issues" stroke="#94a3b8" strokeWidth={3} dot={{ r: 4 }} activeDot={{ r: 6 }} strokeDasharray="5 5" />}
-                            </LineChart>
+                                {(chartView === 'all' || chartView === 'prs') && (
+                                    <Area
+                                        yAxisId="left"
+                                        type="monotone"
+                                        dataKey="prs"
+                                        stroke="#6366f1"
+                                        strokeWidth={3}
+                                        fillOpacity={1}
+                                        fill="url(#colorPrs)"
+                                        name="PRs"
+                                        activeDot={{ r: 6, strokeWidth: 0 }}
+                                    />
+                                )}
+                                {(chartView === 'all' || chartView === 'issues') && (
+                                    <Area
+                                        yAxisId="right"
+                                        type="monotone"
+                                        dataKey="issues"
+                                        stroke="#94a3b8"
+                                        strokeWidth={3}
+                                        fillOpacity={1}
+                                        fill="url(#colorIssues)"
+                                        name="Issues"
+                                        activeDot={{ r: 6, strokeWidth: 0 }}
+                                    />
+                                )}
+                            </AreaChart>
                         </ResponsiveContainer>
                     </div>
                     <div className="mt-4 pt-4 border-t bg-slate-50/50 -mx-6 -mb-6 p-4 rounded-b-lg">
@@ -166,8 +237,8 @@ const Overview = () => {
                                 <AlertCircle className="w-5 h-5 text-yellow-600" />
                             </div>
                             <div>
-                                <h4 className="text-sm font-semibold text-foreground">{data.trend_title}</h4>
-                                <p className="text-xs text-muted-foreground mt-0.5">{data.trend_description}</p>
+                                <h4 className="text-sm font-semibold text-foreground">{data.trend_title || "No significant trend detected"}</h4>
+                                <p className="text-xs text-muted-foreground mt-0.5">{data.trend_description || "Not enough data to determine a trend."}</p>
                             </div>
                         </div>
                     </div>

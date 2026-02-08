@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "sqlite:///./sql_app.db"
     
+    # AI Config
+    GEMINI_API_KEY: Optional[str] = None
+    
     # Signal Thresholds
     STALE_PR_WARNING_DAYS: int = 7
     STALE_PR_CRITICAL_DAYS: int = 14

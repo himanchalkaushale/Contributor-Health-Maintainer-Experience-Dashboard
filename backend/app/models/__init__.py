@@ -19,6 +19,11 @@ class Repository(Base):
     open_issues_count = Column(Integer, default=0)
     open_prs_count = Column(Integer, default=0)
     
+    # Sync Status
+    sync_status = Column(String, default="completed") # queued, syncing, completed, failed
+    sync_item_count = Column(Integer, default=0)
+    sync_total_items = Column(Integer, default=0)
+    
     # Relationships
     pull_requests = relationship("PullRequest", back_populates="repository")
     issues = relationship("Issue", back_populates="repository")
