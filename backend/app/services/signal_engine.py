@@ -1643,6 +1643,76 @@ class SignalEngine:
         }
 
     def _compute_stale_prs_signal(self, repo_id: int) -> Dict[str, Any]:
-        return {} 
+        """Health signal: open PRs that have been waiting too long without a review."""
+        now = datetime.utcnow()
+        stale_threshold = now - timedelta(days=14)
+
+        stale_prs = self.db.query(PullRequest).filter(
+            PullRequest.repository_id == repo_id,
+            PullRequest.state == 'open',
+            PullRequest.has_review == False,
+            PullRequest.created_at < stale_threshold,
+        ).count()
+
+        open_prs = self.db.query(PullRequest).filter(
+            PullRequest.repository_id == repo_id,
+            PullRequest.state == 'open',
+        ).count()
+
+        if stale_prs == 0:
+            severity = 'healthy'
+        elif stale_prs >= 10:
+            severity = 'critical'
+        else:
+            severity = 'warning'
+
+        return {
+            "id": "stale_prs",
+            "name": "Stale Pull Requests",
+            "description": (
+                f"{stale_prs} open PR(s) have been waiting over 14 days without a review."
+                if stale_prs else "No PRs are waiting longer than 14 days for a review."
+            ),
+            "severity": severity,
+            "metadata": {
+                "stale_count": stale_prs,
+                "open_count": open_prs,
+                "threshold_days": 14,
+            },
+        }
+
     def _compute_unanswered_issues(self, repo_id: int) -> Dict[str, Any]:
-        return {}
+        """Health signal: open issues without any maintainer response."""
+        now = datetime.utcnow()
+
+        open_issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == 'open',
+        ).count()
+
+        unanswered = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == 'open',
+            Issue.has_maintainer_response == False,
+        ).count()
+
+        if unanswered == 0:
+            severity = 'healthy'
+        elif unanswered >= 20:
+            severity = 'critical'
+        else:
+            severity = 'warning'
+
+        return {
+            "id": "unanswered_issues",
+            "name": "Unanswered Issues",
+            "description": (
+                f"{unanswered} open issue(s) have not received a maintainer response."
+                if unanswered else "All open issues have received a maintainer response."
+            ),
+            "severity": severity,
+            "metadata": {
+                "unanswered_count": unanswered,
+                "open_count": open_issues,
+            },
+        }
