@@ -209,6 +209,97 @@ class SignalEngine:
             "last_updated": repo.last_synced_at or now,
         }
 
+    def compute_newcomer_funnel(self, repo_id: int, days: int = 365) -> Dict[str, Any]:
+        """First-PR response time, time-to-merge, and whether newcomers returned."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(days=days)
+
+        prs = self.db.query(PullRequest).options(
+            selectinload(PullRequest.author)
+        ).filter(
+            PullRequest.repository_id == repo_id
+        ).all()
+
+        # First PR per author
+        first_pr = {}  # cid -> PullRequest
+        for pr in prs:
+            if not pr.author or _is_bot(pr.author.login) or not pr.created_at:
+                continue
+            cid = pr.author.id
+            created = pr.created_at.replace(tzinfo=None)
+            if cid not in first_pr or created < first_pr[cid].created_at.replace(tzinfo=None):
+                first_pr[cid] = pr
+
+        # Pre-fetch the latest event timestamp per newcomer contributor so we can
+        # determine "returned" without an N+1 query per newcomer.
+        newcomer_cids = []
+        for cid, pr in first_pr.items():
+            if pr.created_at and pr.created_at.replace(tzinfo=None) >= window_start:
+                newcomer_cids.append(cid)
+        last_event_at = {}
+        if newcomer_cids:
+            rows = self.db.query(
+                ContributionEvent.contributor_id,
+                func.max(ContributionEvent.event_at),
+            ).filter(
+                ContributionEvent.repository_id == repo_id,
+                ContributionEvent.contributor_id.in_(newcomer_cids),
+            ).group_by(ContributionEvent.contributor_id).all()
+            last_event_at = {cid: mx for cid, mx in rows if mx is not None}
+
+        response_times = []
+        merge_times = []
+        newcomers = 0
+        returned = 0
+        merged_first = 0
+
+        for cid, pr in first_pr.items():
+            created = pr.created_at.replace(tzinfo=None)
+            if created < window_start:
+                continue
+            newcomers += 1
+
+            if pr.time_to_first_review is not None:
+                response_times.append(pr.time_to_first_review)
+            if pr.merged_at:
+                merged_first += 1
+                merge_times.append((pr.merged_at.replace(tzinfo=None) - created).total_seconds() / 3600.0)
+
+            # Returned? Any contribution event after their first PR creation.
+            latest = last_event_at.get(cid)
+            if latest is not None and latest > pr.created_at:
+                returned += 1
+
+        def med(lst):
+            return round(statistics.median(lst), 1) if lst else None
+
+        retention_rate = round(returned / newcomers * 100, 1) if newcomers else 0
+        merge_rate = round(merged_first / newcomers * 100, 1) if newcomers else 0
+
+        median_resp = med(response_times) or 0.0
+        severity = 'healthy'
+        if median_resp > 72:
+            severity = 'critical'
+        elif median_resp > 24:
+            severity = 'warning'
+
+        return {
+            "newcomers": newcomers,
+            "returned": returned,
+            "retention_rate": retention_rate,
+            "first_pr_merged": merged_first,
+            "merge_rate": merge_rate,
+            "median_first_response_hours": median_resp,
+            "worst_first_response_hours": round(max(response_times), 1) if response_times else 0.0,
+            "median_time_to_merge_hours": med(merge_times),
+            "severity": severity,
+            "last_updated": repo.last_synced_at or now,
+        }
+
     def compute_contributors_health(self, repo_id: int) -> Dict[str, Any]:
         """
         Computes contributor health metrics based on STRICT "Real Contributor Logic":
