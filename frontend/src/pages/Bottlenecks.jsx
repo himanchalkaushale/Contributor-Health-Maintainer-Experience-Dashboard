@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useRepo } from '@/context/RepoContext';
 import { repoService } from '@/services/api';
+import { formatDuration } from '@/lib/utils';
 import { Loader2, Clock, AlertTriangle, AlertCircle, GitPullRequest, ArrowRight, Info, CheckCircle2, MessageSquare, X, Sparkles } from 'lucide-react';
 
 const Bottlenecks = () => {
@@ -74,7 +75,7 @@ const Bottlenecks = () => {
                 />
                 <SummaryCard
                     title="Median Review Time"
-                    value={summary.median_review_hours === null ? "N/A" : `${summary.median_review_hours}h`}
+                    value={formatDuration(summary.median_review_hours)}
                     icon={GitPullRequest}
                     desc="Time to first feedback"
                     color="text-primary"
@@ -186,7 +187,7 @@ const Bottlenecks = () => {
                         <div className="space-y-4">
                             <div className="flex justify-between items-center">
                                 <span className="text-sm text-muted-foreground">Median Review Time</span>
-                                <span className="font-bold">{first_time_prs.median_review_hours}h</span>
+                                <span className="font-bold">{formatDuration(first_time_prs.median_review_hours)}</span>
                             </div>
                             <div className="flex justify-between items-center">
                                 <span className="text-sm text-muted-foreground">Stuck ({'>'} 7 days)</span>
