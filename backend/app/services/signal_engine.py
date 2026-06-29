@@ -1,16 +1,107 @@
-from sqlalchemy.orm import Session
+﻿from sqlalchemy.orm import Session, selectinload, joinedload
 from sqlalchemy import func, distinct
-from app.models import Repository, PullRequest, Issue, Contributor
+from app.models import (
+    Repository, PullRequest, Issue, Contributor, ContributionEvent, Review, Comment, Label,
+)
 from app.config import get_settings
 from datetime import datetime, timedelta
 import statistics
-from typing import Dict, List, Any
+import json
+from typing import Dict, List, Any, Optional
 
 settings = get_settings()
+
+
+def _is_bot(login: str) -> bool:
+    if not login:
+        return True
+    low = login.lower()
+    return low.endswith("[bot]") or low == "github-actions"
 
 class SignalEngine:
     def __init__(self, db: Session):
         self.db = db
+
+    def _earliest_review_at_by_pr(self, pr_ids: List[int]) -> Dict[int, Any]:
+        """Batch-fetch the earliest review submission_at per pull_request_id.
+        Replaces a per-PR `ORDER BY submitted_at LIMIT 1` query (N+1) with one
+        grouped query. Returns {pr_id: submitted_at}."""
+        if not pr_ids:
+            return {}
+        rows = self.db.query(
+            Review.pull_request_id,
+            func.min(Review.submitted_at),
+        ).filter(
+            Review.pull_request_id.in_(pr_ids),
+            Review.submitted_at != None,
+        ).group_by(Review.pull_request_id).all()
+        return {pid: ts for pid, ts in rows if ts is not None}
+
+    def _latest_review_state_by_pr(self, pr_ids: List[int]) -> Dict[int, str]:
+        """Batch-fetch the latest review state per pull_request_id. Loads all
+        reviews for the given PRs in one query and picks the latest per PR in
+        memory, avoiding a per-PR ORDER BY query (N+1)."""
+        if not pr_ids:
+            return {}
+        reviews = self.db.query(Review).filter(
+            Review.pull_request_id.in_(pr_ids),
+            Review.submitted_at != None,
+        ).all()
+        latest: Dict[int, Any] = {}  # pr_id -> (submitted_at, state)
+        for rv in reviews:
+            ts = rv.submitted_at
+            cur = latest.get(rv.pull_request_id)
+            if cur is None or (ts is not None and cur[0] is not None and ts > cur[0]):
+                latest[rv.pull_request_id] = (ts, rv.state)
+        return {pid: state for pid, (_ts, state) in latest.items()}
+
+    def compute_activity_timeline(self, repo_id: int, days: int = 365) -> Dict[str, Any]:
+        """Event counts bucketed by week/month and event_type over the window."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(days=days)
+        # Weekly buckets for <=180d, monthly otherwise
+        granularity = "week" if days <= 180 else "month"
+
+        events = self.db.query(ContributionEvent).filter(
+            ContributionEvent.repository_id == repo_id,
+            ContributionEvent.event_at >= window_start,
+        ).all()
+
+        event_types = ["pr_opened", "pr_merged", "pr_closed", "review_submitted",
+                       "issue_opened", "issue_closed", "issue_comment", "commit"]
+
+        def bucket_key(dt):
+            if granularity == "week":
+                monday = dt - timedelta(days=dt.weekday())
+                return monday.strftime("%Y-%m-%d")
+            return dt.strftime("%Y-%m")
+
+        buckets = {}
+        for ev in events:
+            if not ev.event_at or ev.event_type not in event_types:
+                continue
+            if ev.contributor and _is_bot(ev.contributor.login):
+                continue
+            key = bucket_key(ev.event_at.replace(tzinfo=None))
+            row = buckets.setdefault(key, {et: 0 for et in event_types})
+            row[ev.event_type] += 1
+
+        timeline = []
+        for key in sorted(buckets.keys()):
+            entry = {"period": key}
+            entry.update(buckets[key])
+            timeline.append(entry)
+
+        return {
+            "granularity": granularity,
+            "event_types": event_types,
+            "timeline": timeline,
+            "last_updated": repo.last_synced_at or now,
+        }
 
     def compute_contributors_health(self, repo_id: int) -> Dict[str, Any]:
         """
