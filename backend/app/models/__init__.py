@@ -69,6 +69,29 @@ class PullRequest(Base):
     repository = relationship("Repository", back_populates="pull_requests")
     author = relationship("Contributor", back_populates="pull_requests")
 
+# Association table for Issue <-> Label (many-to-many)
+issue_labels = Table(
+    "issue_labels",
+    Base.metadata,
+    Column("issue_id", Integer, ForeignKey("issues.id"), primary_key=True),
+    Column("label_id", Integer, ForeignKey("labels.id"), primary_key=True),
+)
+
+
+class Label(Base):
+    """GitHub labels for categorization analytics."""
+    __tablename__ = "labels"
+
+    id = Column(Integer, primary_key=True, index=True)
+    github_id = Column(Integer, unique=True, index=True)
+    repository_id = Column(Integer, ForeignKey("repositories.id"), index=True)
+    name = Column(String, index=True)
+    color = Column(String)
+    description = Column(String, nullable=True)
+
+    repository = relationship("Repository")
+
+
 class Issue(Base):
     __tablename__ = "issues"
     
