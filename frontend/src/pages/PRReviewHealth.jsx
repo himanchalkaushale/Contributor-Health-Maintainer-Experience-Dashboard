@@ -101,7 +101,7 @@ const PRReviewHealth = () => {
             const result = await repoService.generateNudge(pr.title, pr.author, pr.age_days);
             setNudgeTexts((prev) => ({ ...prev, [pr.number]: result.nudge || result.message || JSON.stringify(result) }));
             setNudgeOpen(pr.number);
-        } catch (e) {
+        } catch {
             setNudgeTexts((prev) => ({ ...prev, [pr.number]: 'Failed to generate nudge. Please try again.' }));
             setNudgeOpen(pr.number);
         } finally {

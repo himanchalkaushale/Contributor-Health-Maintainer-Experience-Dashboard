@@ -69,7 +69,7 @@ const IssuesHealth = () => {
                 if (base.status === 'rejected' && triage.status === 'rejected') {
                     setError('Failed to fetch issues analytics.');
                 }
-            } catch (err) {
+            } catch {
                 if (!cancelled) setError('Failed to fetch issues analytics.');
             } finally {
                 if (!cancelled && !silent) setLoading(false);

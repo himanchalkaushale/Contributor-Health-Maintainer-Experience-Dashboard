@@ -86,7 +86,7 @@ const Contributors = () => {
                 if (health && health.status === 'rejected' && (!tl || tl.status === 'rejected')) {
                     setError('Failed to fetch contributor analytics.');
                 }
-            } catch (err) {
+            } catch {
                 if (!cancelled) setError('Failed to fetch contributor analytics.');
             } finally {
                 if (!cancelled && !silent) setLoading(false);
@@ -503,7 +503,7 @@ function formatPeriod(period) {
     return period;
 }
 
-const ActivityTooltip = ({ active, payload, label, series, formatPeriod }) => {
+const ActivityTooltip = ({ active, payload, label, formatPeriod }) => {
     if (!active || !payload || payload.length === 0) return null;
     const total = payload.reduce((sum, p) => sum + (p.value || 0), 0);
     return (
