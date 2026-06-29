@@ -1298,6 +1298,116 @@ class SignalEngine:
             "last_updated": repo.last_synced_at or datetime.utcnow()
         }
 
+    # ------------------------------------------------------------------
+    # Issues Analytics Phase (6 new functions)
+    # ------------------------------------------------------------------
+
+    def compute_issue_triage_load(self, repo_id: int, days: int = 90) -> Dict[str, Any]:
+        """Who responds to issues fastest/most - for team coordination."""
+        from sqlalchemy import func
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        window_start = datetime.utcnow() - timedelta(days=days)
+
+        issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.has_maintainer_response == True,
+            Issue.first_responder_id != None,
+            Issue.created_at >= window_start
+        ).all()
+
+        responder_stats = {}
+        for issue in issues:
+            responder_id = issue.first_responder_id
+            if not responder_id:
+                continue
+            if responder_id not in responder_stats:
+                responder_stats[responder_id] = {
+                    "count": 0, "response_times": [], "unassigned": 0
+                }
+            responder_stats[responder_id]["count"] += 1
+            if issue.time_to_first_response:
+                responder_stats[responder_id]["response_times"].append(issue.time_to_first_response)
+
+        open_unassigned = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open",
+            Issue.assignee_id == None
+        ).all()
+
+        for issue in open_unassigned:
+            if issue.first_responder_id and issue.first_responder_id in responder_stats:
+                responder_stats[issue.first_responder_id]["unassigned"] += 1
+
+        maintainers = []
+        for cid, stats in responder_stats.items():
+            maintainer = self.db.query(Contributor).get(cid)
+            if not maintainer or _is_bot(maintainer.login):
+                continue
+            avg_time = statistics.median(stats["response_times"]) if stats["response_times"] else None
+            maintainers.append({
+                "login": maintainer.login,
+                "avatar_url": maintainer.avatar_url,
+                "triage_count": stats["count"],
+                "avg_response_hours": round(avg_time, 1) if avg_time else None,
+                "unassigned_queue": stats["unassigned"],
+                "status": "critical" if stats["unassigned"] > 10 else ("warning" if stats["unassigned"] > 5 else "healthy")
+            })
+
+        maintainers.sort(key=lambda x: x["triage_count"], reverse=True)
+        return {"maintainers": maintainers, "last_updated": repo.last_synced_at or datetime.utcnow()}
+
+    def compute_issue_workload_balance(self, repo_id: int) -> Dict[str, Any]:
+        """Assigned workload distribution - for team coordination."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        assignee_counts = self.db.query(Issue.assignee_id, func.count(Issue.id)).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open",
+            Issue.assignee_id != None
+        ).group_by(Issue.assignee_id).all()
+
+        unassigned_count = self.db.query(func.count(Issue.id)).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open",
+            Issue.assignee_id == None
+        ).scalar() or 0
+
+        maintainers = []
+        for assignee_id, count in assignee_counts:
+            maintainer = self.db.query(Contributor).get(assignee_id)
+            if not maintainer or _is_bot(maintainer.login):
+                continue
+
+            avg_age = self.db.query(func.avg(
+                func.julianday(datetime.utcnow()) - func.julianday(Issue.created_at)
+            )).filter(
+                Issue.repository_id == repo_id,
+                Issue.state == "open",
+                Issue.assignee_id == assignee_id
+            ).scalar() or 0
+
+            maintainers.append({
+                "login": maintainer.login,
+                "avatar_url": maintainer.avatar_url,
+                "assigned_count": count,
+                "avg_age_days": round(avg_age),
+                "capacity": "overloaded" if count > 20 else ("busy" if count > 10 else "available")
+            })
+
+        maintainers.sort(key=lambda x: x["assigned_count"], reverse=True)
+
+        return {
+            "maintainers": maintainers,
+            "unassigned_count": unassigned_count,
+            "rebalance_suggested": len([m for m in maintainers if m["capacity"] == "overloaded"]) > 0 and unassigned_count > 0,
+            "last_updated": repo.last_synced_at or datetime.utcnow()
+        }
+
     def _compute_stale_prs_signal(self, repo_id: int) -> Dict[str, Any]:
         return {} 
     def _compute_unanswered_issues(self, repo_id: int) -> Dict[str, Any]:
