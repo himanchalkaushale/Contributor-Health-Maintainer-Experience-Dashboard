@@ -1408,6 +1408,134 @@ class SignalEngine:
             "last_updated": repo.last_synced_at or datetime.utcnow()
         }
 
+    def compute_issue_trends(self, repo_id: int, days: int = 90) -> Dict[str, Any]:
+        """Weekly response time trends with category breakdown - for quality metrics."""
+        from sqlalchemy import func
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(days=days)
+
+        issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.has_maintainer_response == True,
+            Issue.time_to_first_response != None,
+            Issue.created_at >= window_start
+        ).all()
+
+        weeks = []
+        for i in range(12, -1, -1):
+            week_end = now - timedelta(weeks=i)
+            week_start = week_end - timedelta(weeks=1)
+            weeks.append((week_start, week_end, f"W{12-i}"))
+
+        def get_category(issue):
+            if not issue.labels_snapshot:
+                return "other"
+            labels = json.loads(issue.labels_snapshot)
+            labels_lower = [l.lower() for l in labels]
+            if "bug" in labels_lower or "type: bug" in labels_lower:
+                return "bug"
+            if "enhancement" in labels_lower or "feature" in labels_lower or "type: feature" in labels_lower:
+                return "enhancement"
+            if "question" in labels_lower or "help wanted" in labels_lower:
+                return "question"
+            return "other"
+
+        timeline = []
+        for week_start, week_end, label in weeks:
+            week_issues = [i for i in issues if week_start <= i.created_at < week_end]
+            response_times = [i.time_to_first_response for i in week_issues if i.time_to_first_response]
+            median_resp = statistics.median(response_times) if response_times else None
+
+            categories = {"bug": 0, "enhancement": 0, "question": 0, "other": 0}
+            for i in week_issues:
+                categories[get_category(i)] += 1
+
+            timeline.append({
+                "week": label,
+                "median_response_hours": round(median_resp, 1) if median_resp else None,
+                "total_responded": len(week_issues),
+                "categories": categories
+            })
+
+        last_month = [t for t in timeline if t["week"].startswith("W")][-4:] if len(timeline) >= 4 else timeline
+        prev_month = timeline[-8:-4] if len(timeline) >= 8 else timeline[:4]
+
+        last_avg = statistics.median([t["median_response_hours"] for t in last_month if t["median_response_hours"]]) if last_month else 0
+        prev_avg = statistics.median([t["median_response_hours"] for t in prev_month if t["median_response_hours"]]) if prev_month else 0
+
+        trend_direction = "stable"
+        if last_avg and prev_avg:
+            if last_avg > prev_avg * 1.2:
+                trend_direction = "slower"
+            elif last_avg < prev_avg * 0.8:
+                trend_direction = "faster"
+
+        return {
+            "timeline": timeline,
+            "trend_direction": trend_direction,
+            "target_sla_hours": 48,
+            "last_updated": repo.last_synced_at or now
+        }
+
+    def compute_issue_category_breakdown(self, repo_id: int) -> Dict[str, Any]:
+        """Open issues grouped by label category - for buried in issues scenario."""
+        from sqlalchemy import func
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        open_issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open"
+        ).all()
+
+        categories = {
+            "bug": {"issues": [], "count": 0, "median_age_days": 0},
+            "enhancement": {"issues": [], "count": 0, "median_age_days": 0},
+            "question": {"issues": [], "count": 0, "median_age_days": 0},
+            "other": {"issues": [], "count": 0, "median_age_days": 0},
+            "unlabeled": {"issues": [], "count": 0, "median_age_days": 0}
+        }
+
+        now = datetime.utcnow()
+
+        for issue in open_issues:
+            labels = self._parse_labels(issue.labels_snapshot)
+            if not labels:
+                categories["unlabeled"]["issues"].append(issue)
+                continue
+
+            labels_lower = [l.lower() for l in labels]
+
+            if "bug" in labels_lower or "type: bug" in labels_lower:
+                categories["bug"]["issues"].append(issue)
+            elif "enhancement" in labels_lower or "feature" in labels_lower:
+                categories["enhancement"]["issues"].append(issue)
+            elif "question" in labels_lower or "help wanted" in labels_lower:
+                categories["question"]["issues"].append(issue)
+            else:
+                categories["other"]["issues"].append(issue)
+
+        result = {}
+        for cat_name, cat_data in categories.items():
+            issues = cat_data["issues"]
+            ages = [(now - i.created_at).days for i in issues]
+            result[cat_name] = {
+                "count": len(issues),
+                "median_age_days": int(statistics.median(ages)) if ages else 0,
+                "unanswered_count": len([i for i in issues if not i.has_maintainer_response]),
+                "percent_of_total": round(len(issues) / len(open_issues) * 100, 1) if open_issues else 0
+            }
+
+        result["total_open"] = len(open_issues)
+        result["last_updated"] = repo.last_synced_at or now
+
+        return result
+
     def _compute_stale_prs_signal(self, repo_id: int) -> Dict[str, Any]:
         return {} 
     def _compute_unanswered_issues(self, repo_id: int) -> Dict[str, Any]:
