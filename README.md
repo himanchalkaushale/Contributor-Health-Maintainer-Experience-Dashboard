@@ -101,6 +101,19 @@ npm run dev
 http://localhost:5173
 ```
 
+> **Schema note:** The contributor analytics feature adds new tables
+> (`contribution_events`, `reviews`, `comments`) and populates additional
+> columns. There is no migration tooling — tables are created on startup via
+> `Base.metadata.create_all`. If you are upgrading an existing database and
+> want the new analytics populated from scratch, delete the SQLite database
+> first so it is recreated and re-synced:
+> ```bash
+> # from backend/
+> rm sql_app.db sql_app.db-shm sql_app.db-wal   # PowerShell: Remove-Item sql_app.db*
+> ```
+> Then restart the backend and re-sync each repository. New tables are created
+> automatically; only previously-synced data needs a re-sync to backfill events.
+
 ---
 
 ## 🎬 Demo

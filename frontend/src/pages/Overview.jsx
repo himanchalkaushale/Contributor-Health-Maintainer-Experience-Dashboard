@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { useGSAP } from '@gsap/react';
 import gsap from 'gsap';
 import { useRepo } from '@/context/RepoContext';
@@ -67,7 +68,10 @@ const Overview = () => {
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
 
                 {/* Active Contributors */}
-                <div className="summary-card bg-card p-5 rounded-lg border shadow-sm group relative">
+                <Link
+                    to="/contributors#active-contributors"
+                    className="summary-card block bg-card p-5 rounded-lg border shadow-sm group relative cursor-pointer transition-colors hover:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                >
                     <div className="flex justify-between items-start mb-2">
                         <div className="flex items-center gap-1.5 cursor-help">
                             <span className="text-sm font-medium text-muted-foreground">Active Contributors</span>
@@ -82,10 +86,13 @@ const Overview = () => {
                     <div className="absolute top-full left-0 mt-2 w-48 bg-popover border p-2 rounded shadow-lg text-xs hidden group-hover:block z-50">
                         Users who opened a PR/Issue, reviewed, or commented in the last 30d.
                     </div>
-                </div>
+                </Link>
 
                 {/* Open PRs */}
-                <div className={`summary-card bg-card p-5 rounded-lg border shadow-sm border-l-4 ${data.stale_prs > 5 ? 'border-l-yellow-500' : 'border-l-emerald-500'} group relative`}>
+                <Link
+                    to="/pr-review-health#attention-queue"
+                    className={`summary-card block bg-card p-5 rounded-lg border shadow-sm border-l-4 ${data.stale_prs > 5 ? 'border-l-yellow-500' : 'border-l-emerald-500'} group relative cursor-pointer transition-colors hover:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary`}
+                >
                     <div className="flex justify-between items-start mb-2">
                         <span className="text-sm font-medium text-muted-foreground">Open PRs</span>
                         <GitPullRequest className="w-5 h-5 text-muted-foreground/70" />
@@ -96,10 +103,13 @@ const Overview = () => {
                     <div className="absolute top-full left-0 mt-2 w-48 bg-popover border p-2 rounded shadow-lg text-xs hidden group-hover:block z-50">
                         Total open PRs. Warning tracks stale PRs unreviewed for 14+ days.
                     </div>
-                </div>
+                </Link>
 
                 {/* Avg Review Time */}
-                <div className="summary-card bg-card p-5 rounded-lg border shadow-sm border-l-4 border-l-emerald-500 group relative">
+                <Link
+                    to="/pr-review-health#review-flow"
+                    className="summary-card block bg-card p-5 rounded-lg border shadow-sm border-l-4 border-l-emerald-500 group relative cursor-pointer transition-colors hover:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                >
                     <div className="flex justify-between items-start mb-2">
                         <span className="text-sm font-medium text-muted-foreground">Median Review Time</span>
                         <Clock className="w-5 h-5 text-muted-foreground/70" />
@@ -110,10 +120,13 @@ const Overview = () => {
                     <div className="absolute top-full left-0 mt-2 w-48 bg-popover border p-2 rounded shadow-lg text-xs hidden group-hover:block z-50">
                         Median time from creation to first review for PRs in last 90 days.
                     </div>
-                </div>
+                </Link>
 
                 {/* Unanswered Issues */}
-                <div className={`summary-card bg-card p-5 rounded-lg border shadow-sm border-l-4 ${data.unanswered_issues > 5 ? 'border-l-red-500' : 'border-l-emerald-500'} group relative`}>
+                <Link
+                    to="/issues#unanswered-issues"
+                    className={`summary-card block bg-card p-5 rounded-lg border shadow-sm border-l-4 ${data.unanswered_issues > 5 ? 'border-l-red-500' : 'border-l-emerald-500'} group relative cursor-pointer transition-colors hover:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary`}
+                >
                     <div className="flex justify-between items-start mb-2">
                         <span className="text-sm font-medium text-muted-foreground">Unanswered Issues</span>
                         <AlertCircle className="w-5 h-5 text-muted-foreground/70" />
@@ -129,7 +142,7 @@ const Overview = () => {
                             </div>
                         ))}
                     </div>
-                </div>
+                </Link>
             </div>
 
             {/* Chart - Kept same as verified */}

@@ -1,16 +1,59 @@
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload, joinedload
 from sqlalchemy import func, distinct
-from app.models import Repository, PullRequest, Issue, Contributor
+from app.models import (
+    Repository, PullRequest, Issue, Contributor, ContributionEvent, Review, Comment, Label,
+)
 from app.config import get_settings
 from datetime import datetime, timedelta
 import statistics
-from typing import Dict, List, Any
+import json
+from typing import Dict, List, Any, Optional
 
 settings = get_settings()
+
+
+def _is_bot(login: str) -> bool:
+    if not login:
+        return True
+    low = login.lower()
+    return low.endswith("[bot]") or low == "github-actions"
 
 class SignalEngine:
     def __init__(self, db: Session):
         self.db = db
+
+    def _earliest_review_at_by_pr(self, pr_ids: List[int]) -> Dict[int, Any]:
+        """Batch-fetch the earliest review submission_at per pull_request_id.
+        Replaces a per-PR `ORDER BY submitted_at LIMIT 1` query (N+1) with one
+        grouped query. Returns {pr_id: submitted_at}."""
+        if not pr_ids:
+            return {}
+        rows = self.db.query(
+            Review.pull_request_id,
+            func.min(Review.submitted_at),
+        ).filter(
+            Review.pull_request_id.in_(pr_ids),
+            Review.submitted_at != None,
+        ).group_by(Review.pull_request_id).all()
+        return {pid: ts for pid, ts in rows if ts is not None}
+
+    def _latest_review_state_by_pr(self, pr_ids: List[int]) -> Dict[int, str]:
+        """Batch-fetch the latest review state per pull_request_id. Loads all
+        reviews for the given PRs in one query and picks the latest per PR in
+        memory, avoiding a per-PR ORDER BY query (N+1)."""
+        if not pr_ids:
+            return {}
+        reviews = self.db.query(Review).filter(
+            Review.pull_request_id.in_(pr_ids),
+            Review.submitted_at != None,
+        ).all()
+        latest: Dict[int, Any] = {}  # pr_id -> (submitted_at, state)
+        for rv in reviews:
+            ts = rv.submitted_at
+            cur = latest.get(rv.pull_request_id)
+            if cur is None or (ts is not None and cur[0] is not None and ts > cur[0]):
+                latest[rv.pull_request_id] = (ts, rv.state)
+        return {pid: state for pid, (_ts, state) in latest.items()}
 
     def compute_contributors_health(self, repo_id: int) -> Dict[str, Any]:
         """
@@ -27,89 +70,92 @@ class SignalEngine:
             now = datetime.utcnow()
             thirty_days_ago = now - timedelta(days=30)
             forty_five_days_ago = now - timedelta(days=45)
-            
-            # 1. Gather all events (PRs + Issues) mapped by Author
-            # Filter out bots in Python loop for flexibility (or SQL 'NOT LIKE')
-            contributor_stats = {} # {cid: {first, last, type, login, avatar}}
 
-            def is_bot(login: str) -> bool:
-                if not login: return True
-                return login.lower().endswith("[bot]") or login.lower() == "github-actions"
+            # 1. Gather first/last activity per contributor from the unified event table.
+            contributor_stats = {}  # {cid: {first, last, type, login, avatar}}
 
-            # Scan PRs
+            events = self.db.query(ContributionEvent).filter(
+                ContributionEvent.repository_id == repo_id
+            ).all()
+
+            # Map event_type -> coarse activity label for the table
+            def label_for(et):
+                if et and et.startswith("pr"):
+                    return "pr_open"
+                if et and et.startswith("review"):
+                    return "pr_review"
+                if et == "issue_comment":
+                    return "issue_comment"
+                if et and et.startswith("issue"):
+                    return "issue_open"
+                return et or "activity"
+
+            for ev in events:
+                contributor = ev.contributor
+                if not contributor or _is_bot(contributor.login):
+                    continue
+                if not ev.event_at:
+                    continue
+                cid = contributor.id
+                date = ev.event_at.replace(tzinfo=None)
+                if cid not in contributor_stats:
+                    contributor_stats[cid] = {
+                        'first': date, 'last': date, 'type': label_for(ev.event_type),
+                        'login': contributor.login, 'avatar': contributor.avatar_url,
+                    }
+                else:
+                    s = contributor_stats[cid]
+                    if date < s['first']:
+                        s['first'] = date
+                    if date > s['last']:
+                        s['last'] = date
+                        s['type'] = label_for(ev.event_type)
+
+            # PRs are still needed for first-time response metrics below.
             prs = self.db.query(PullRequest).filter(PullRequest.repository_id == repo_id).all()
-            for pr in prs:
-                if not pr.author or is_bot(pr.author.login): continue
-                cid = pr.author.id
-                if not pr.created_at: continue
-                # Fix Timezone Mismatch
-                date = pr.created_at.replace(tzinfo=None)
-                
-                if cid not in contributor_stats:
-                    contributor_stats[cid] = {'first': date, 'last': date, 'type': 'pr_open', 'login': pr.author.login, 'avatar': pr.author.avatar_url}
-                else:
-                    if date < contributor_stats[cid]['first']: contributor_stats[cid]['first'] = date
-                    if date > contributor_stats[cid]['last']: 
-                        contributor_stats[cid]['last'] = date
-                        contributor_stats[cid]['type'] = 'pr_open'
 
-            # Scan Issues
-            issues = self.db.query(Issue).filter(Issue.repository_id == repo_id).all()
-            for issue in issues:
-                if not issue.author or is_bot(issue.author.login): continue
-                cid = issue.author.id
-                if not issue.created_at: continue
-                # Fix Timezone Mismatch
-                date = issue.created_at.replace(tzinfo=None)
-                
-                if cid not in contributor_stats:
-                    contributor_stats[cid] = {'first': date, 'last': date, 'type': 'issue_open', 'login': issue.author.login, 'avatar': issue.author.avatar_url}
-                else:
-                    if date < contributor_stats[cid]['first']: contributor_stats[cid]['first'] = date
-                    if date > contributor_stats[cid]['last']: 
-                        contributor_stats[cid]['last'] = date
-                        contributor_stats[cid]['type'] = 'issue_open'
-
-            # 2. Bucket Contributors
+            # 2. Bucket Contributors.
+            # Buckets are mutually exclusive and exhaustive (fixes the 30-45d dead zone):
+            #   active   = last activity within 30d
+            #     - new       : first activity also within 30d
+            #     - returning : first activity older than 30d
+            #   churned  = last activity older than 45d
+            #   dormant  = last activity 30-45d ago (at-risk, not yet churned)
             new_count = 0
             returning_count = 0
             churned_count = 0
+            dormant_count = 0
             active_list = []
-            
+
             for cid, stats in contributor_stats.items():
                 first = stats['first']
                 last = stats['last']
-                
-                # Active Window Check
-                is_active_now = last >= thirty_days_ago
-                
-                if is_active_now:
-                    # NEW: First ever activity was recent
+
+                if last >= thirty_days_ago:
                     if first >= thirty_days_ago:
                         new_count += 1
                     else:
-                        # RETURNING: Active before, and Active again now
                         returning_count += 1
-                    
-                    # Active Table Logic
+
                     days_ago = (now - last).days
-                    status = 'healthy' # Default healthy if active recently
-                    # Refined status based on recency within the 30d window
-                    if days_ago > 14: status = 'warning' 
-                    if days_ago > 21: status = 'critical'
-                    
+                    status = 'healthy'
+                    if days_ago > 14:
+                        status = 'warning'
+                    if days_ago > 21:
+                        status = 'critical'
+
                     active_list.append({
                         "login": stats['login'],
                         "avatar_url": stats['avatar'],
                         "last_activity_date": last,
                         "activity_type": stats['type'],
-                        "status": status
+                        "status": status,
                     })
+                elif last < forty_five_days_ago:
+                    churned_count += 1
                 else:
-                    # Inactive / Churned Logic
-                    # Churned if last activity > 45 days ago
-                    if last < forty_five_days_ago:
-                        churned_count += 1
+                    # 30-45 days: at-risk / dormant (previously uncounted)
+                    dormant_count += 1
 
             active_list.sort(key=lambda x: x['last_activity_date'], reverse=True)
             
@@ -152,6 +198,7 @@ class SignalEngine:
                     "new": new_count,
                     "returning": returning_count,
                     "churned": churned_count,
+                    "dormant": dormant_count,
                     "active": len(active_list)
                 },
                 "first_time_experience": {
@@ -167,6 +214,251 @@ class SignalEngine:
             traceback.print_exc()
             print(f"ERROR calculating contributors: {e}")
             return None
+
+    def compute_activity_timeline(self, repo_id: int, days: int = 365) -> Dict[str, Any]:
+        """Event counts bucketed by week/month and event_type over the window."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(days=days)
+        # Weekly buckets for <=180d, monthly otherwise
+        granularity = "week" if days <= 180 else "month"
+
+        events = self.db.query(ContributionEvent).filter(
+            ContributionEvent.repository_id == repo_id,
+            ContributionEvent.event_at >= window_start,
+        ).all()
+
+        event_types = ["pr_opened", "pr_merged", "pr_closed", "review_submitted",
+                       "issue_opened", "issue_closed", "issue_comment", "commit"]
+
+        def bucket_key(dt):
+            if granularity == "week":
+                monday = dt - timedelta(days=dt.weekday())
+                return monday.strftime("%Y-%m-%d")
+            return dt.strftime("%Y-%m")
+
+        buckets = {}
+        for ev in events:
+            if not ev.event_at or ev.event_type not in event_types:
+                continue
+            if ev.contributor and _is_bot(ev.contributor.login):
+                continue
+            key = bucket_key(ev.event_at.replace(tzinfo=None))
+            row = buckets.setdefault(key, {et: 0 for et in event_types})
+            row[ev.event_type] += 1
+
+        timeline = []
+        for key in sorted(buckets.keys()):
+            entry = {"period": key}
+            entry.update(buckets[key])
+            timeline.append(entry)
+
+        return {
+            "granularity": granularity,
+            "event_types": event_types,
+            "timeline": timeline,
+            "last_updated": repo.last_synced_at or now,
+        }
+
+    def compute_leaderboard(self, repo_id: int, days: int = 365) -> Dict[str, Any]:
+        """Per-contributor PRs merged, reviews given, comments, commits, tenure."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(days=days)
+
+        events = self.db.query(ContributionEvent).options(
+            selectinload(ContributionEvent.contributor)
+        ).filter(
+            ContributionEvent.repository_id == repo_id,
+            ContributionEvent.event_at >= window_start,
+        ).all()
+
+        agg = {}  # cid -> stats
+        for ev in events:
+            c = ev.contributor
+            if not c or _is_bot(c.login) or not ev.event_at:
+                continue
+            row = agg.setdefault(c.id, {
+                "login": c.login, "avatar_url": c.avatar_url, "html_url": c.html_url,
+                "prs_opened": 0, "prs_merged": 0, "reviews": 0, "comments": 0,
+                "commits": 0, "first": ev.event_at, "last": ev.event_at,
+            })
+            dt = ev.event_at.replace(tzinfo=None)
+            if dt < row["first"]:
+                row["first"] = dt
+            if dt > row["last"]:
+                row["last"] = dt
+            if ev.event_type == "pr_opened":
+                row["prs_opened"] += 1
+            elif ev.event_type == "pr_merged":
+                row["prs_merged"] += 1
+            elif ev.event_type == "review_submitted":
+                row["reviews"] += 1
+            elif ev.event_type == "issue_comment":
+                row["comments"] += 1
+            elif ev.event_type == "commit":
+                row["commits"] += 1
+
+        leaderboard = []
+        for cid, r in agg.items():
+            first = r["first"].replace(tzinfo=None) if hasattr(r["first"], "replace") else r["first"]
+            last = r["last"].replace(tzinfo=None) if hasattr(r["last"], "replace") else r["last"]
+            tenure_days = max(0, (last - first).days)
+            total = r["prs_opened"] + r["prs_merged"] + r["reviews"] + r["comments"] + r["commits"]
+            leaderboard.append({
+                "login": r["login"], "avatar_url": r["avatar_url"], "html_url": r["html_url"],
+                "prs_opened": r["prs_opened"], "prs_merged": r["prs_merged"],
+                "reviews": r["reviews"], "comments": r["comments"], "commits": r["commits"],
+                "tenure_days": tenure_days, "total_contributions": total,
+            })
+
+        leaderboard.sort(key=lambda x: x["total_contributions"], reverse=True)
+        return {"leaderboard": leaderboard, "last_updated": repo.last_synced_at or now}
+
+    def compute_reviewer_load(self, repo_id: int, days: int = 365) -> Dict[str, Any]:
+        """Per reviewer: review count, median latency, share of total reviews."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(days=days)
+
+        reviews = self.db.query(Review).options(
+            joinedload(Review.reviewer)
+        ).filter(
+            Review.repository_id == repo_id,
+            Review.submitted_at >= window_start,
+        ).all()
+
+        agg = {}
+        total_reviews = 0
+        for rv in reviews:
+            reviewer = rv.reviewer
+            if not reviewer or _is_bot(reviewer.login):
+                continue
+            total_reviews += 1
+            row = agg.setdefault(reviewer.id, {
+                "login": reviewer.login, "avatar_url": reviewer.avatar_url,
+                "count": 0, "latencies": [],
+            })
+            row["count"] += 1
+            if rv.latency_hours is not None and rv.latency_hours >= 0:
+                row["latencies"].append(rv.latency_hours)
+
+        reviewers = []
+        for cid, r in agg.items():
+            median_latency = statistics.median(r["latencies"]) if r["latencies"] else None
+            reviewers.append({
+                "login": r["login"], "avatar_url": r["avatar_url"],
+                "reviews": r["count"],
+                "median_latency_hours": round(median_latency, 1) if median_latency is not None else None,
+                "share_percent": round(r["count"] / total_reviews * 100, 1) if total_reviews else 0,
+            })
+
+        reviewers.sort(key=lambda x: x["reviews"], reverse=True)
+        return {
+            "total_reviews": total_reviews,
+            "reviewers": reviewers,
+            "last_updated": repo.last_synced_at or now,
+        }
+
+    def compute_newcomer_funnel(self, repo_id: int, days: int = 365) -> Dict[str, Any]:
+        """First-PR response time, time-to-merge, and whether newcomers returned."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(days=days)
+
+        prs = self.db.query(PullRequest).options(
+            selectinload(PullRequest.author)
+        ).filter(
+            PullRequest.repository_id == repo_id
+        ).all()
+
+        # First PR per author
+        first_pr = {}  # cid -> PullRequest
+        for pr in prs:
+            if not pr.author or _is_bot(pr.author.login) or not pr.created_at:
+                continue
+            cid = pr.author.id
+            created = pr.created_at.replace(tzinfo=None)
+            if cid not in first_pr or created < first_pr[cid].created_at.replace(tzinfo=None):
+                first_pr[cid] = pr
+
+        # Pre-fetch the latest event timestamp per newcomer contributor so we can
+        # determine "returned" without an N+1 query per newcomer.
+        newcomer_cids = []
+        for cid, pr in first_pr.items():
+            if pr.created_at and pr.created_at.replace(tzinfo=None) >= window_start:
+                newcomer_cids.append(cid)
+        last_event_at = {}
+        if newcomer_cids:
+            rows = self.db.query(
+                ContributionEvent.contributor_id,
+                func.max(ContributionEvent.event_at),
+            ).filter(
+                ContributionEvent.repository_id == repo_id,
+                ContributionEvent.contributor_id.in_(newcomer_cids),
+            ).group_by(ContributionEvent.contributor_id).all()
+            last_event_at = {cid: mx for cid, mx in rows if mx is not None}
+
+        response_times = []
+        merge_times = []
+        newcomers = 0
+        returned = 0
+        merged_first = 0
+
+        for cid, pr in first_pr.items():
+            created = pr.created_at.replace(tzinfo=None)
+            if created < window_start:
+                continue
+            newcomers += 1
+
+            if pr.time_to_first_review is not None:
+                response_times.append(pr.time_to_first_review)
+            if pr.merged_at:
+                merged_first += 1
+                merge_times.append((pr.merged_at.replace(tzinfo=None) - created).total_seconds() / 3600.0)
+
+            # Returned? Any contribution event after their first PR creation.
+            latest = last_event_at.get(cid)
+            if latest is not None and latest > pr.created_at:
+                returned += 1
+
+        def med(lst):
+            return round(statistics.median(lst), 1) if lst else None
+
+        retention_rate = round(returned / newcomers * 100, 1) if newcomers else 0
+        merge_rate = round(merged_first / newcomers * 100, 1) if newcomers else 0
+
+        median_resp = med(response_times) or 0.0
+        severity = 'healthy'
+        if median_resp > 72:
+            severity = 'critical'
+        elif median_resp > 24:
+            severity = 'warning'
+
+        return {
+            "newcomers": newcomers,
+            "returned": returned,
+            "retention_rate": retention_rate,
+            "first_pr_merged": merged_first,
+            "merge_rate": merge_rate,
+            "median_first_response_hours": median_resp,
+            "worst_first_response_hours": round(max(response_times), 1) if response_times else 0.0,
+            "median_time_to_merge_hours": med(merge_times),
+            "severity": severity,
+            "last_updated": repo.last_synced_at or now,
+        }
 
     def compute_pr_bottlenecks(self, repo_id: int) -> Dict[str, Any]:
         """
@@ -314,6 +606,19 @@ class SignalEngine:
             print(f"ERROR calculating PR bottlenecks: {e}")
             return None
 
+    @staticmethod
+    def _parse_labels(labels_snapshot: Optional[str]) -> List[str]:
+        """Safely parse the JSON labels snapshot into a list of label names."""
+        if not labels_snapshot:
+            return []
+        try:
+            labels = json.loads(labels_snapshot)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(labels, list):
+            return []
+        return [str(l) for l in labels]
+
     def compute_issues_health(self, repo_id: int) -> Dict[str, Any]:
         """
         Computes data for the Issues Page.
@@ -368,7 +673,7 @@ class SignalEngine:
                     "title": issue.title,
                     "author": issue.author.login if issue.author else "unknown",
                     "age_days": age_days,
-                    "labels": [], # Schema limitation: labels not stored
+                    "labels": self._parse_labels(issue.labels_snapshot),
                     "status": status,
                     "html_url": f"https://github.com/{repo.owner}/{repo.name}/issues/{issue.number}"
                 })
@@ -387,8 +692,9 @@ class SignalEngine:
             }
             
             # --- 4. Issue Triage Quality ---
-            # % with labels -> Mocked 0% for now
-            percent_labelled = 0 
+            # % of open issues that carry at least one label
+            labelled_count = sum(1 for i in open_issues if self._parse_labels(i.labels_snapshot))
+            percent_labelled = (labelled_count / open_issues_count * 100) if open_issues_count else 0
             
             # % < 48h response (of those responded to in last 90d)
             under_48h = sum(1 for t in response_times if t < 48)
@@ -458,18 +764,13 @@ class SignalEngine:
             import traceback
             traceback.print_exc()
             print(f"ERROR calculating Issues health: {e}")
-            print(f"ERROR calculating Issues health: {e}")
             return None
 
-    def compute_pr_review_health(self, repo_id: int) -> Dict[str, Any]:
+    def compute_pr_review_health(self, repo_id: int, days: int = 90) -> Dict[str, Any]:
         """
-        Calculates PR Review Health metrics:
-        1. Open PRs
-        2. Unreviewed PRs (Open & has_review=False)
-        3. PRs Waiting > 7 Days
-        4. Median Review Time
-        5. Attention Queue (Table of critical PRs)
-        6. Review Flow Insight
+        Calculates PR Review Health metrics with enhanced KPIs, trends, funnel, and alerts.
+        Backward-compatible: preserves existing `summary`, `attention_queue`, `review_flow` keys.
+        New keys: `kpis`, `trends`, `wait_distribution`, `funnel`, `alerts`.
         """
         now = datetime.utcnow()
         repo = self.db.query(Repository).get(repo_id)
@@ -477,93 +778,395 @@ class SignalEngine:
             return None
 
         try:
-            # --- 1. Basic Counts ---
+            # --- Window definitions ---
+            window_start = now - timedelta(days=days)
+            prior_start = now - timedelta(days=days * 2)
+            seven_days_ago = now - timedelta(days=7)
+            fourteen_days_ago = now - timedelta(days=14)
+
+            # --- 1. Basic Counts (existing, null-safe) ---
             open_prs = self.db.query(PullRequest).filter(
                 PullRequest.repository_id == repo_id,
                 PullRequest.state == 'open'
             ).all()
             open_prs_count = len(open_prs)
 
-            # --- 2. Unreviewed PRs (The Risk Metric) ---
-            # Proxy: Open AND has_review is False
             unreviewed_prs = [pr for pr in open_prs if not pr.has_review]
             unreviewed_count = len(unreviewed_prs)
 
-            # --- 3. Waiting > 7 Days ---
-            seven_days_ago = now - timedelta(days=7)
-            waiting_over_7d = [pr for pr in open_prs if pr.created_at < seven_days_ago]
+            waiting_over_7d = [pr for pr in open_prs if pr.created_at and pr.created_at < seven_days_ago]
             waiting_over_7d_count = len(waiting_over_7d)
 
-            # --- 4. Median Review Time ---
-            ninety_days_ago = now - timedelta(days=90)
-            reviewed_prs_90d = self.db.query(PullRequest).filter(
+            # --- 2. Median Review Time (within window) ---
+            reviewed_prs_window = self.db.query(PullRequest).filter(
                 PullRequest.repository_id == repo_id,
                 PullRequest.time_to_first_review != None,
-                PullRequest.created_at >= ninety_days_ago
+                PullRequest.created_at >= window_start
             ).all()
-            
-            review_times = [pr.time_to_first_review for pr in reviewed_prs_90d]
-            median_review_hours = statistics.median(review_times) if review_times else None
+            review_times = [pr.time_to_first_review for pr in reviewed_prs_window if pr.time_to_first_review is not None]
+            median_review_hours = round(statistics.median(review_times), 1) if review_times else None
 
-            # --- 5. Attention Queue (The Action Table) ---
-            # Unified list: Unreviewed first, then by age.
-            attention_queue = []
-            
+            # --- 3. NEW: Time-to-Merge ---
+            # Current window: merged PRs with both created_at and merged_at
+            merged_prs_window = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.merged_at != None,
+                PullRequest.merged_at >= window_start,
+                PullRequest.created_at != None
+            ).all()
+
+            ttm_hours_current = []
+            for pr in merged_prs_window:
+                if pr.merged_at and pr.created_at:
+                    h = (pr.merged_at - pr.created_at).total_seconds() / 3600.0
+                    if h >= 0:
+                        ttm_hours_current.append(h)
+
+            time_to_merge_median = round(statistics.median(ttm_hours_current), 1) if ttm_hours_current else None
+            time_to_merge_mean = round(statistics.mean(ttm_hours_current), 1) if ttm_hours_current else None
+
+            # Prior window for delta
+            merged_prs_prior = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.merged_at != None,
+                PullRequest.merged_at >= prior_start,
+                PullRequest.merged_at < window_start,
+                PullRequest.created_at != None
+            ).all()
+            ttm_hours_prior = []
+            for pr in merged_prs_prior:
+                if pr.merged_at and pr.created_at:
+                    h = (pr.merged_at - pr.created_at).total_seconds() / 3600.0
+                    if h >= 0:
+                        ttm_hours_prior.append(h)
+            time_to_merge_median_prior = statistics.median(ttm_hours_prior) if ttm_hours_prior else None
+            time_to_merge_delta = None
+            if time_to_merge_median is not None and time_to_merge_median_prior is not None and time_to_merge_median_prior != 0:
+                time_to_merge_delta = round(((time_to_merge_median - time_to_merge_median_prior) / time_to_merge_median_prior) * 100, 1)
+
+            # --- 4. NEW: Review Cycle Time ---
+            # Time from first review to merge/close for closed/merged PRs in window
+            closed_prs_window = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.state != 'open',
+                PullRequest.closed_at != None,
+                PullRequest.closed_at >= window_start
+            ).all()
+
+            rct_hours_current = []
+            earliest_review_current = self._earliest_review_at_by_pr([pr.id for pr in closed_prs_window])
+            for pr in closed_prs_window:
+                end_dt = pr.merged_at or pr.closed_at
+                if not end_dt:
+                    continue
+                # Earliest review (batch-fetched) or the stored proxy value.
+                first_review_dt = earliest_review_current.get(pr.id)
+                if first_review_dt is None and pr.time_to_first_review is not None:
+                    # Proxy: created_at + time_to_first_review hours
+                    first_review_dt = pr.created_at + timedelta(hours=pr.time_to_first_review)
+                elif first_review_dt is None:
+                    continue
+
+                h = (end_dt - first_review_dt).total_seconds() / 3600.0
+                if h >= 0:
+                    rct_hours_current.append(h)
+
+            review_cycle_time_median = round(statistics.median(rct_hours_current), 1) if rct_hours_current else None
+
+            # Prior window delta for review cycle time
+            closed_prs_prior = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.state != 'open',
+                PullRequest.closed_at != None,
+                PullRequest.closed_at >= prior_start,
+                PullRequest.closed_at < window_start
+            ).all()
+
+            rct_hours_prior = []
+            earliest_review_prior = self._earliest_review_at_by_pr([pr.id for pr in closed_prs_prior])
+            for pr in closed_prs_prior:
+                end_dt = pr.merged_at or pr.closed_at
+                if not end_dt:
+                    continue
+                first_review_dt = earliest_review_prior.get(pr.id)
+                if first_review_dt is None and pr.time_to_first_review is not None:
+                    first_review_dt = pr.created_at + timedelta(hours=pr.time_to_first_review)
+                elif first_review_dt is None:
+                    continue
+                h = (end_dt - first_review_dt).total_seconds() / 3600.0
+                if h >= 0:
+                    rct_hours_prior.append(h)
+
+            review_cycle_time_median_prior = statistics.median(rct_hours_prior) if rct_hours_prior else None
+            review_cycle_time_delta = None
+            if review_cycle_time_median is not None and review_cycle_time_median_prior is not None and review_cycle_time_median_prior != 0:
+                review_cycle_time_delta = round(((review_cycle_time_median - review_cycle_time_median_prior) / review_cycle_time_median_prior) * 100, 1)
+
+            # --- 5. NEW: Comment Density ---
+            # Average comments per PR for PRs in window (created_at in window)
+            prs_in_window = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.created_at >= window_start
+            ).all()
+
+            comment_density = None
+            comment_density_source = "reviews_count"
+            if prs_in_window:
+                # Try Comment table first (joined by issue_number) — batched into a
+                # single grouped query instead of one COUNT() per PR (N+1).
+                pr_numbers_in_window = [pr.number for pr in prs_in_window if pr.number is not None]
+                if pr_numbers_in_window:
+                    comment_counts = {pr.id: 0 for pr in prs_in_window}
+                    num_to_prid = {pr.number: pr.id for pr in prs_in_window if pr.number is not None}
+                    rows = self.db.query(
+                        Comment.issue_number,
+                        func.count(Comment.id),
+                    ).filter(
+                        Comment.repository_id == repo_id,
+                        Comment.issue_number.in_(pr_numbers_in_window),
+                        Comment.created_at >= window_start,
+                    ).group_by(Comment.issue_number).all()
+                    for issue_number, cnt in rows:
+                        prid = num_to_prid.get(issue_number)
+                        if prid is not None:
+                            comment_counts[prid] = cnt
+
+                    if any(v > 0 for v in comment_counts.values()):
+                        comment_density_source = "comment_table"
+                        comment_density = round(sum(comment_counts.values()) / len(prs_in_window), 2)
+                    else:
+                        # Fallback: use reviews_count
+                        rc_values = [pr.reviews_count for pr in prs_in_window if pr.reviews_count is not None]
+                        if rc_values:
+                            comment_density = round(statistics.mean(rc_values), 2)
+
+            # Prior window comment density delta
+            prs_in_prior = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.created_at >= prior_start,
+                PullRequest.created_at < window_start
+            ).all()
+            comment_density_prior = None
+            if prs_in_prior:
+                if comment_density_source == "comment_table":
+                    prior_pr_numbers = [pr.number for pr in prs_in_prior if pr.number is not None]
+                    prior_comment_counts = []
+                    if prior_pr_numbers:
+                        rows = self.db.query(
+                            Comment.issue_number,
+                            func.count(Comment.id),
+                        ).filter(
+                            Comment.repository_id == repo_id,
+                            Comment.issue_number.in_(prior_pr_numbers),
+                            Comment.created_at >= prior_start,
+                            Comment.created_at < window_start,
+                        ).group_by(Comment.issue_number).all()
+                        counts_by_number = {n: c for n, c in rows}
+                        for pr in prs_in_prior:
+                            if pr.number is not None:
+                                prior_comment_counts.append(counts_by_number.get(pr.number, 0))
+                    if prior_comment_counts:
+                        comment_density_prior = sum(prior_comment_counts) / len(prs_in_prior)
+                else:
+                    rc_vals = [pr.reviews_count for pr in prs_in_prior if pr.reviews_count is not None]
+                    if rc_vals:
+                        comment_density_prior = statistics.mean(rc_vals)
+
+            comment_density_delta = None
+            if comment_density is not None and comment_density_prior is not None and comment_density_prior != 0:
+                comment_density_delta = round(((comment_density - comment_density_prior) / comment_density_prior) * 100, 1)
+
+            # --- 6. NEW: Trend Series (weekly buckets within window) ---
+            trend_series = []
+            # Use ceil so the most recent partial week is covered too (a 90-day
+            # window otherwise truncates to 12 weeks = 84 days and drops the
+            # last ~6 days of merges/review-cycle times).
+            import math
+            bucket_weeks = max(1, math.ceil(days / 7))
+            for i in range(bucket_weeks):
+                bucket_start = window_start + timedelta(weeks=i)
+                bucket_end = bucket_start + timedelta(weeks=1)
+                if bucket_start > now:
+                    break
+
+                # Merged PRs in this week bucket
+                bucket_merged = [pr for pr in merged_prs_window
+                                 if pr.merged_at and bucket_start <= pr.merged_at < bucket_end]
+                merged_count = len(bucket_merged)
+
+                bucket_ttm = []
+                for pr in bucket_merged:
+                    if pr.created_at:
+                        h = (pr.merged_at - pr.created_at).total_seconds() / 3600.0
+                        if h >= 0:
+                            bucket_ttm.append(h)
+
+                bucket_closed = [pr for pr in closed_prs_window
+                                 if pr.closed_at and bucket_start <= pr.closed_at < bucket_end]
+                bucket_rct = []
+                for pr in bucket_closed:
+                    end_dt = pr.merged_at or pr.closed_at
+                    if not end_dt:
+                        continue
+                    # Reuse the batch-fetched earliest-review map (no per-PR query).
+                    first_review_dt = earliest_review_current.get(pr.id)
+                    if first_review_dt is None and pr.time_to_first_review is not None:
+                        first_review_dt = pr.created_at + timedelta(hours=pr.time_to_first_review)
+                    elif first_review_dt is None:
+                        continue
+                    h = (end_dt - first_review_dt).total_seconds() / 3600.0
+                    if h >= 0:
+                        bucket_rct.append(h)
+
+                trend_series.append({
+                    "week_start": bucket_start.strftime("%Y-%m-%d"),
+                    "time_to_merge_hours": round(statistics.median(bucket_ttm), 1) if bucket_ttm else None,
+                    "review_cycle_hours": round(statistics.median(bucket_rct), 1) if bucket_rct else None,
+                    "merged_count": merged_count
+                })
+
+            # --- 7. NEW: Wait-time Distribution ---
+            # For open unreviewed PRs: current wait. For reviewed/closed PRs in window: time_to_first_review.
+            wait_times = []
             for pr in open_prs:
-                age_days = (now - pr.created_at).days
+                if not pr.has_review and pr.created_at:
+                    wait_h = (now - pr.created_at).total_seconds() / 3600.0
+                    wait_times.append(wait_h)
+            for pr in reviewed_prs_window:
+                if pr.time_to_first_review is not None:
+                    wait_times.append(pr.time_to_first_review)
+
+            dist = {"0_2d": 0, "gt2_7d": 0, "gt7_14d": 0, "14d_plus": 0}
+            for h in wait_times:
+                d = h / 24.0
+                if d <= 2:
+                    dist["0_2d"] += 1
+                elif d <= 7:
+                    dist["gt2_7d"] += 1
+                elif d <= 14:
+                    dist["gt7_14d"] += 1
+                else:
+                    dist["14d_plus"] += 1
+
+            wait_distribution = [
+                {"bucket": "0–2d", "count": dist["0_2d"]},
+                {"bucket": ">2–7d", "count": dist["gt2_7d"]},
+                {"bucket": ">7–14d", "count": dist["gt7_14d"]},
+                {"bucket": "14d+", "count": dist["14d_plus"]},
+            ]
+
+            # --- 8. NEW: Review-stage Funnel ---
+            # Unreviewed (open, no review)
+            funnel_unreviewed = unreviewed_count
+
+            # In Review: open PRs that have a review but not approved/merged
+            approved_states = {'approved', 'APPROVED'}
+            in_review_prs = 0
+            approved_prs = 0
+            reviewed_open_pr_ids = [pr.id for pr in open_prs if pr.has_review]
+            latest_review_state = self._latest_review_state_by_pr(reviewed_open_pr_ids)
+            for pr in open_prs:
+                if pr.has_review:
+                    state = latest_review_state.get(pr.id)
+                    if state in approved_states:
+                        approved_prs += 1
+                    else:
+                        in_review_prs += 1
+
+            # Merged within window
+            funnel_merged = len(merged_prs_window)
+
+            funnel = [
+                {"stage": "Unreviewed", "count": funnel_unreviewed},
+                {"stage": "In Review", "count": in_review_prs},
+                {"stage": "Approved", "count": approved_prs},
+                {"stage": "Merged", "count": funnel_merged},
+            ]
+
+            # --- 9. NEW: Stale Alerts ---
+            critical_stale = []
+            warning_stale = []
+            for pr in open_prs:
+                if not pr.has_review and pr.created_at:
+                    age_d = (now - pr.created_at).days
+                    if age_d > 14:
+                        critical_stale.append(pr.number)
+                    elif age_d > 7:
+                        warning_stale.append(pr.number)
+
+            alerts = {
+                "critical_count": len(critical_stale),
+                "warning_count": len(warning_stale),
+                "stale_pr_numbers": critical_stale + warning_stale
+            }
+
+            # --- 10. Attention Queue (existing, enhanced with nudge fields and deep-links) ---
+            attention_queue = []
+            for pr in open_prs:
+                age_days = (now - pr.created_at).days if pr.created_at else 0
                 is_unreviewed = not pr.has_review
-                
-                # Status Logic
+
                 status = 'healthy'
                 if is_unreviewed:
-                    if age_days > 7: status = 'critical'
-                    else: status = 'warning' # Unreviewed is always at least a warning in this view? Or just heavily weighted.
-                    # Let's stick to Age-based status for consistency, but Unreviewed is the sort key.
+                    if age_days > 7:
+                        status = 'critical'
+                    else:
+                        status = 'warning'
                 else:
-                    if age_days > 14: status = 'critical'
-                    elif age_days > 7: status = 'warning'
+                    if age_days > 14:
+                        status = 'critical'
+                    elif age_days > 7:
+                        status = 'warning'
 
-                # Last Activity Proxy
-                last_activity = 'None' if is_unreviewed else 'Maintainer' # Simplification based on has_review
+                last_activity = 'None' if is_unreviewed else 'Maintainer'
+                base_url = f"https://github.com/{repo.owner}/{repo.name}/pull/{pr.number}"
 
                 attention_queue.append({
                     "number": pr.number,
-                    "title": pr.title,
+                    "title": pr.title or "",
                     "author": pr.author.login if pr.author else "unknown",
                     "age_days": age_days,
                     "last_activity": last_activity,
                     "status": status,
                     "is_unreviewed": is_unreviewed,
-                    "html_url": f"https://github.com/{repo.owner}/{repo.name}/pull/{pr.number}"
+                    "html_url": base_url,
+                    "files_url": f"{base_url}/files",
+                    "reviews_url": f"{base_url}/files#reviews",
                 })
 
-            # Sort: Unreviewed First (True > False), then Age Descending
-            attention_queue.sort(key=lambda x: (not x['is_unreviewed'], -x['age_days'])) # False < True, so not True (False) comes first? 
-            # Wait, True > False is 1 > 0. Descending sort puts True first. 
-            # Start with explicit tuple sort:
-            # Primary: is_unreviewed (True first) -> Reverse
-            # Secondary: age_days (High first) -> Reverse
             attention_queue.sort(key=lambda x: (x['is_unreviewed'], x['age_days']), reverse=True)
-            
-            # --- 6. Review Flow Insight ---
-            # Simple breakdown
-            waiting_for_first_review = unreviewed_count # Roughly same concept for this page
-            # "Near Merge" is hard to guess without CI status. 
-            # Let's use: Reviewed but not merged
+
+            # --- 11. Review Flow Insight (existing, backward-compatible) ---
             reviewed_open = open_prs_count - unreviewed_count
-            
+
             return {
+                # --- Existing keys (backward-compatible) ---
                 "summary": {
                     "open_prs": open_prs_count,
                     "unreviewed_prs": unreviewed_count,
                     "waiting_over_7d": waiting_over_7d_count,
-                    "median_review_hours": round(median_review_hours, 1) if median_review_hours is not None else None
+                    "median_review_hours": median_review_hours
                 },
                 "attention_queue": attention_queue,
                 "review_flow": {
-                    "waiting_for_first_review": waiting_for_first_review,
+                    "waiting_for_first_review": unreviewed_count,
                     "in_review_process": reviewed_open
-                }
+                },
+                # --- New keys ---
+                "kpis": {
+                    "time_to_merge_median_hours": time_to_merge_median,
+                    "time_to_merge_mean_hours": time_to_merge_mean,
+                    "time_to_merge_delta_pct": time_to_merge_delta,
+                    "review_cycle_time_median_hours": review_cycle_time_median,
+                    "review_cycle_time_delta_pct": review_cycle_time_delta,
+                    "comment_density": comment_density,
+                    "comment_density_delta_pct": comment_density_delta,
+                    "comment_density_source": comment_density_source,
+                },
+                "trends": trend_series,
+                "wait_distribution": wait_distribution,
+                "funnel": funnel,
+                "alerts": alerts,
             }
 
         except Exception as e:
@@ -733,7 +1336,433 @@ class SignalEngine:
             "last_updated": repo.last_synced_at or datetime.utcnow()
         }
 
+    # ------------------------------------------------------------------
+    # Issues Analytics Phase (6 new functions)
+    # ------------------------------------------------------------------
+
+    def compute_issue_triage_load(self, repo_id: int, days: int = 90) -> Dict[str, Any]:
+        """Who responds to issues fastest/most - for team coordination."""
+        from sqlalchemy import func
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        window_start = datetime.utcnow() - timedelta(days=days)
+
+        # Get all issues with maintainer response in window
+        issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.has_maintainer_response == True,
+            Issue.first_responder_id != None,
+            Issue.created_at >= window_start
+        ).all()
+
+        # Group by first_responder
+        responder_stats = {}
+        for issue in issues:
+            responder_id = issue.first_responder_id
+            if not responder_id:
+                continue
+            if responder_id not in responder_stats:
+                responder_stats[responder_id] = {
+                    "count": 0, "response_times": [], "unassigned": 0
+                }
+            responder_stats[responder_id]["count"] += 1
+            if issue.time_to_first_response:
+                responder_stats[responder_id]["response_times"].append(issue.time_to_first_response)
+
+        # Count currently unassigned issues per responder (zombie detection)
+        open_unassigned = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open",
+            Issue.assignee_id == None
+        ).all()
+
+        for issue in open_unassigned:
+            if issue.first_responder_id and issue.first_responder_id in responder_stats:
+                responder_stats[issue.first_responder_id]["unassigned"] += 1
+
+        # Build response
+        maintainers = []
+        for cid, stats in responder_stats.items():
+            maintainer = self.db.query(Contributor).get(cid)
+            if not maintainer or _is_bot(maintainer.login):
+                continue
+            avg_time = statistics.median(stats["response_times"]) if stats["response_times"] else None
+            maintainers.append({
+                "login": maintainer.login,
+                "avatar_url": maintainer.avatar_url,
+                "triage_count": stats["count"],
+                "avg_response_hours": round(avg_time, 1) if avg_time else None,
+                "unassigned_queue": stats["unassigned"],
+                "status": "critical" if stats["unassigned"] > 10 else ("warning" if stats["unassigned"] > 5 else "healthy")
+            })
+
+        maintainers.sort(key=lambda x: x["triage_count"], reverse=True)
+        return {"maintainers": maintainers, "last_updated": repo.last_synced_at or datetime.utcnow()}
+
+    def compute_issue_workload_balance(self, repo_id: int) -> Dict[str, Any]:
+        """Assigned workload distribution - for team coordination."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        # Count issues per assignee
+        assignee_counts = self.db.query(Issue.assignee_id, func.count(Issue.id)).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open",
+            Issue.assignee_id != None
+        ).group_by(Issue.assignee_id).all()
+
+        # Unassigned count
+        unassigned_count = self.db.query(func.count(Issue.id)).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open",
+            Issue.assignee_id == None
+        ).scalar() or 0
+
+        maintainers = []
+        for assignee_id, count in assignee_counts:
+            maintainer = self.db.query(Contributor).get(assignee_id)
+            if not maintainer or _is_bot(maintainer.login):
+                continue
+
+            # Calculate avg age of assigned issues
+            avg_age = self.db.query(func.avg(
+                func.julianday(datetime.utcnow()) - func.julianday(Issue.created_at)
+            )).filter(
+                Issue.repository_id == repo_id,
+                Issue.state == "open",
+                Issue.assignee_id == assignee_id
+            ).scalar() or 0
+
+            maintainers.append({
+                "login": maintainer.login,
+                "avatar_url": maintainer.avatar_url,
+                "assigned_count": count,
+                "avg_age_days": round(avg_age),
+                "capacity": "overloaded" if count > 20 else ("busy" if count > 10 else "available")
+            })
+
+        maintainers.sort(key=lambda x: x["assigned_count"], reverse=True)
+
+        return {
+            "maintainers": maintainers,
+            "unassigned_count": unassigned_count,
+            "rebalance_suggested": len([m for m in maintainers if m["capacity"] == "overloaded"]) > 0 and unassigned_count > 0,
+            "last_updated": repo.last_synced_at or datetime.utcnow()
+        }
+
+    def compute_issue_trends(self, repo_id: int, days: int = 90) -> Dict[str, Any]:
+        """Weekly response time trends with category breakdown - for quality metrics."""
+        from sqlalchemy import func
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(days=days)
+
+        # Get all responded issues in window
+        issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.has_maintainer_response == True,
+            Issue.time_to_first_response != None,
+            Issue.created_at >= window_start
+        ).all()
+
+        # Define bucket keys for last 12 weeks
+        weeks = []
+        for i in range(12, -1, -1):
+            week_end = now - timedelta(weeks=i)
+            week_start = week_end - timedelta(weeks=1)
+            weeks.append((week_start, week_end, f"W{12-i}"))
+
+        # Categorize issues
+        def get_category(issue):
+            if not issue.labels_snapshot:
+                return "other"
+            labels = json.loads(issue.labels_snapshot)
+            labels_lower = [l.lower() for l in labels]
+            if "bug" in labels_lower or "type: bug" in labels_lower:
+                return "bug"
+            if "enhancement" in labels_lower or "feature" in labels_lower or "type: feature" in labels_lower:
+                return "enhancement"
+            if "question" in labels_lower or "help wanted" in labels_lower:
+                return "question"
+            return "other"
+
+        # Aggregate by week
+        timeline = []
+        for week_start, week_end, label in weeks:
+            week_issues = [i for i in issues if week_start <= i.created_at < week_end]
+            response_times = [i.time_to_first_response for i in week_issues if i.time_to_first_response]
+            median_resp = statistics.median(response_times) if response_times else None
+
+            # Category breakdown
+            categories = {"bug": 0, "enhancement": 0, "question": 0, "other": 0}
+            for i in week_issues:
+                categories[get_category(i)] += 1
+
+            timeline.append({
+                "week": label,
+                "median_response_hours": round(median_resp, 1) if median_resp else None,
+                "total_responded": len(week_issues),
+                "categories": categories
+            })
+
+        # Overall trend (comparing last month vs previous month)
+        last_month = [t for t in timeline if t["week"].startswith("W")][-4:] if len(timeline) >= 4 else timeline
+        prev_month = timeline[-8:-4] if len(timeline) >= 8 else timeline[:4]
+
+        last_avg = statistics.median([t["median_response_hours"] for t in last_month if t["median_response_hours"]]) if last_month else 0
+        prev_avg = statistics.median([t["median_response_hours"] for t in prev_month if t["median_response_hours"]]) if prev_month else 0
+
+        trend_direction = "stable"
+        if last_avg and prev_avg:
+            if last_avg > prev_avg * 1.2:
+                trend_direction = "slower"
+            elif last_avg < prev_avg * 0.8:
+                trend_direction = "faster"
+
+        return {
+            "timeline": timeline,
+            "trend_direction": trend_direction,
+            "target_sla_hours": 48,
+            "last_updated": repo.last_synced_at or now
+        }
+
+    def compute_first_timer_issue_queue(self, repo_id: int, max_items: int = 20) -> Dict[str, Any]:
+        """Priority queue of first-timer issues needing response - for first-timer outreach."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        twenty_four_hours_ago = now - timedelta(hours=24)
+        seven_days_ago = now - timedelta(days=7)
+
+        # Get first-timer contributors (first_contribution_date within last 30 days)
+        first_timers = self.db.query(Contributor).filter(
+            Contributor.first_contribution_date >= now - timedelta(days=30)
+        ).all()
+        first_timer_ids = {c.id for c in first_timers}
+
+        # Get their open, unanswered issues
+        issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open",
+            Issue.has_maintainer_response == False,
+            Issue.author_id.in_(first_timer_ids),
+            Issue.created_at <= twenty_four_hours_ago  # Waiting at least 24h
+        ).order_by(Issue.created_at).all()
+
+        # Calculate priority scores
+        scored_issues = []
+        for issue in issues:
+            age_hours = (now - issue.created_at).total_seconds() / 3600
+            labels = self._parse_labels(issue.labels_snapshot)
+
+            # Priority score:
+            #  - age contribution, capped at 72h so very old items don't dominate
+            #  - flat first-timer bonus (every issue here is from a first-timer)
+            #  - bug bonus to surface impactful reports
+            age_component = min(age_hours, 72)
+            first_timer_bonus = 100
+            bug_bonus = 50 if any("bug" in l.lower() for l in labels) else 0
+            score = age_component + first_timer_bonus + bug_bonus
+
+            author = issue.author
+            scored_issues.append({
+                "number": issue.number,
+                "title": issue.title,
+                "author_login": author.login if author else "unknown",
+                "author_avatar": author.avatar_url if author else None,
+                "age_hours": round(age_hours, 1),
+                "age_days": int(age_hours / 24),
+                "labels": labels,
+                "priority_score": round(score, 1),
+                "html_url": f"https://github.com/{repo.owner}/{repo.name}/issues/{issue.number}",
+                "critical": age_hours > 72
+            })
+
+        # Sort by priority score descending
+        scored_issues.sort(key=lambda x: x["priority_score"], reverse=True)
+
+        return {
+            "queue": scored_issues[:max_items],
+            "total_count": len(scored_issues),
+            "critical_count": len([i for i in scored_issues if i["critical"]]),
+            "last_updated": repo.last_synced_at or now
+        }
+
+    def compute_zombie_issues(self, repo_id: int) -> Dict[str, Any]:
+        """Issues that got a response but were then abandoned - for buried in issues scenario."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        seven_days_ago = now - timedelta(days=7)
+
+        # Zombie: has response, no assignee, updated_at is old
+        # We use a heuristic: updated_at > 7 days ago suggests stale
+        issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open",
+            Issue.has_maintainer_response == True,
+            Issue.assignee_id == None,
+            Issue.updated_at < seven_days_ago
+        ).order_by(Issue.updated_at).all()
+
+        zombie_list = []
+        for issue in issues:
+            days_since_update = (now - issue.updated_at).days
+            zombie_list.append({
+                "number": issue.number,
+                "title": issue.title,
+                "author": issue.author.login if issue.author else "unknown",
+                "days_since_response": days_since_update,
+                "last_responder": issue.first_responder.login if issue.first_responder else "unknown",
+                "labels": self._parse_labels(issue.labels_snapshot),
+                "status": "critical" if days_since_update > 30 else ("warning" if days_since_update > 14 else "stale"),
+                "html_url": f"https://github.com/{repo.owner}/{repo.name}/issues/{issue.number}"
+            })
+
+        return {
+            "zombie_issues": zombie_list[:50],
+            "total_count": len(zombie_list),
+            "last_updated": repo.last_synced_at or now
+        }
+
+    def compute_issue_category_breakdown(self, repo_id: int) -> Dict[str, Any]:
+        """Open issues grouped by label category - for buried in issues scenario."""
+        from sqlalchemy import func
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        open_issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open"
+        ).all()
+
+        # Categorize
+        categories = {
+            "bug": {"issues": [], "count": 0, "median_age_days": 0},
+            "enhancement": {"issues": [], "count": 0, "median_age_days": 0},
+            "question": {"issues": [], "count": 0, "median_age_days": 0},
+            "other": {"issues": [], "count": 0, "median_age_days": 0},
+            "unlabeled": {"issues": [], "count": 0, "median_age_days": 0}
+        }
+
+        now = datetime.utcnow()
+
+        for issue in open_issues:
+            labels = self._parse_labels(issue.labels_snapshot)
+            if not labels:
+                categories["unlabeled"]["issues"].append(issue)
+                continue
+
+            labels_lower = [l.lower() for l in labels]
+
+            if "bug" in labels_lower or "type: bug" in labels_lower:
+                categories["bug"]["issues"].append(issue)
+            elif "enhancement" in labels_lower or "feature" in labels_lower:
+                categories["enhancement"]["issues"].append(issue)
+            elif "question" in labels_lower or "help wanted" in labels_lower:
+                categories["question"]["issues"].append(issue)
+            else:
+                categories["other"]["issues"].append(issue)
+
+        # Calculate stats per category
+        result = {}
+        for cat_name, cat_data in categories.items():
+            issues = cat_data["issues"]
+            ages = [(now - i.created_at).days for i in issues]
+            result[cat_name] = {
+                "count": len(issues),
+                "median_age_days": int(statistics.median(ages)) if ages else 0,
+                "unanswered_count": len([i for i in issues if not i.has_maintainer_response]),
+                "percent_of_total": round(len(issues) / len(open_issues) * 100, 1) if open_issues else 0
+            }
+
+        result["total_open"] = len(open_issues)
+        result["last_updated"] = repo.last_synced_at or now
+
+        return result
+
     def _compute_stale_prs_signal(self, repo_id: int) -> Dict[str, Any]:
-        return {} 
+        """Health signal: open PRs that have been waiting too long without a review."""
+        now = datetime.utcnow()
+        stale_threshold = now - timedelta(days=14)
+
+        stale_prs = self.db.query(PullRequest).filter(
+            PullRequest.repository_id == repo_id,
+            PullRequest.state == 'open',
+            PullRequest.has_review == False,
+            PullRequest.created_at < stale_threshold,
+        ).count()
+
+        open_prs = self.db.query(PullRequest).filter(
+            PullRequest.repository_id == repo_id,
+            PullRequest.state == 'open',
+        ).count()
+
+        if stale_prs == 0:
+            severity = 'healthy'
+        elif stale_prs >= 10:
+            severity = 'critical'
+        else:
+            severity = 'warning'
+
+        return {
+            "id": "stale_prs",
+            "name": "Stale Pull Requests",
+            "description": (
+                f"{stale_prs} open PR(s) have been waiting over 14 days without a review."
+                if stale_prs else "No PRs are waiting longer than 14 days for a review."
+            ),
+            "severity": severity,
+            "metadata": {
+                "stale_count": stale_prs,
+                "open_count": open_prs,
+                "threshold_days": 14,
+            },
+        }
+
     def _compute_unanswered_issues(self, repo_id: int) -> Dict[str, Any]:
-        return {}
+        """Health signal: open issues without any maintainer response."""
+        now = datetime.utcnow()
+
+        open_issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == 'open',
+        ).count()
+
+        unanswered = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == 'open',
+            Issue.has_maintainer_response == False,
+        ).count()
+
+        if unanswered == 0:
+            severity = 'healthy'
+        elif unanswered >= 20:
+            severity = 'critical'
+        else:
+            severity = 'warning'
+
+        return {
+            "id": "unanswered_issues",
+            "name": "Unanswered Issues",
+            "description": (
+                f"{unanswered} open issue(s) have not received a maintainer response."
+                if unanswered else "All open issues have received a maintainer response."
+            ),
+            "severity": severity,
+            "metadata": {
+                "unanswered_count": unanswered,
+                "open_count": open_issues,
+            },
+        }

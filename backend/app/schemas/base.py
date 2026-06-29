@@ -67,6 +67,7 @@ class ContributorSummary(BaseModel):
     new: int
     returning: int
     churned: int
+    dormant: int = 0
     active: int
 
 class ContributorsHealthResponse(BaseModel):

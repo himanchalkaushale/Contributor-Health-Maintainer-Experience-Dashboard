@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float, Text, Index, Table
 from sqlalchemy.orm import relationship
 from app.database import Base
 from datetime import datetime
@@ -42,7 +42,9 @@ class Contributor(Base):
     
     # Relationships
     pull_requests = relationship("PullRequest", back_populates="author")
-    issues = relationship("Issue", back_populates="author")
+    authored_issues = relationship("Issue", foreign_keys="Issue.author_id", back_populates="author")
+    assigned_issues = relationship("Issue", foreign_keys="Issue.assignee_id", back_populates="assignee")
+    first_responded_issues = relationship("Issue", foreign_keys="Issue.first_responder_id", back_populates="first_responder")
 
 class PullRequest(Base):
     __tablename__ = "pull_requests"
@@ -69,9 +71,32 @@ class PullRequest(Base):
     repository = relationship("Repository", back_populates="pull_requests")
     author = relationship("Contributor", back_populates="pull_requests")
 
+# Association table for Issue <-> Label (many-to-many)
+issue_labels = Table(
+    "issue_labels",
+    Base.metadata,
+    Column("issue_id", Integer, ForeignKey("issues.id"), primary_key=True),
+    Column("label_id", Integer, ForeignKey("labels.id"), primary_key=True),
+)
+
+
+class Label(Base):
+    """GitHub labels for categorization analytics."""
+    __tablename__ = "labels"
+
+    id = Column(Integer, primary_key=True, index=True)
+    github_id = Column(Integer, unique=True, index=True)
+    repository_id = Column(Integer, ForeignKey("repositories.id"), index=True)
+    name = Column(String, index=True)
+    color = Column(String)
+    description = Column(String, nullable=True)
+
+    repository = relationship("Repository")
+
+
 class Issue(Base):
     __tablename__ = "issues"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     github_id = Column(Integer, unique=True, index=True)
     number = Column(Integer)
@@ -80,17 +105,25 @@ class Issue(Base):
     created_at = Column(DateTime)
     updated_at = Column(DateTime)
     closed_at = Column(DateTime, nullable=True)
-    
+
     repository_id = Column(Integer, ForeignKey("repositories.id"))
     author_id = Column(Integer, ForeignKey("contributors.id"))
-    
+
+    # Assignee and workload tracking (Phase 1 of Issues Analytics)
+    assignee_id = Column(Integer, ForeignKey("contributors.id"), nullable=True)
+    first_responder_id = Column(Integer, ForeignKey("contributors.id"), nullable=True)
+    labels_snapshot = Column(Text, nullable=True)  # JSON string for fast LIKE queries
+
     # Analysis fields
     comments_count = Column(Integer, default=0)
     has_maintainer_response = Column(Boolean, default=False)
     time_to_first_response = Column(Float, nullable=True) # in hours
-    
+
     repository = relationship("Repository", back_populates="issues")
-    author = relationship("Contributor", back_populates="issues")
+    author = relationship("Contributor", foreign_keys=[author_id], back_populates="authored_issues")
+    assignee = relationship("Contributor", foreign_keys=[assignee_id], back_populates="assigned_issues")
+    first_responder = relationship("Contributor", foreign_keys=[first_responder_id], back_populates="first_responded_issues")
+    labels = relationship("Label", secondary=issue_labels, backref="issues")
 
 class RepositoryStats(Base):
     __tablename__ = "repository_stats"
@@ -104,3 +137,65 @@ class RepositoryStats(Base):
     active_contributors = Column(Integer, default=0)
     
     repository = relationship("Repository", back_populates="historical_stats")
+
+class ContributionEvent(Base):
+    """
+    Unified activity event table. One row per contribution action
+    (PR opened/merged/closed, review, issue opened/closed, comment, commit).
+    Powers the activity timeline, leaderboard, reviewer-load and newcomer analytics.
+    """
+    __tablename__ = "contribution_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    repository_id = Column(Integer, ForeignKey("repositories.id"), index=True)
+    contributor_id = Column(Integer, ForeignKey("contributors.id"), index=True)
+
+    # pr_opened, pr_merged, pr_closed, review_submitted,
+    # issue_opened, issue_closed, issue_comment, commit
+    event_type = Column(String, index=True)
+    event_at = Column(DateTime, index=True)
+
+    # GitHub id of the source object (PR/issue/review/comment/commit sha)
+    source_id = Column(String, nullable=True)
+    # Extra payload: review state, additions/deletions, pr number, etc.
+    meta = Column(Text, nullable=True)
+
+    repository = relationship("Repository")
+    contributor = relationship("Contributor")
+
+    __table_args__ = (
+        Index("ix_event_repo_time", "repository_id", "event_at"),
+        Index("ix_event_repo_contributor", "repository_id", "contributor_id"),
+    )
+
+class Review(Base):
+    """PR review detail for reviewer-load and responsiveness analytics."""
+    __tablename__ = "reviews"
+
+    id = Column(Integer, primary_key=True, index=True)
+    github_id = Column(Integer, unique=True, index=True)
+    repository_id = Column(Integer, ForeignKey("repositories.id"), index=True)
+    pull_request_id = Column(Integer, ForeignKey("pull_requests.id"), nullable=True)
+    reviewer_id = Column(Integer, ForeignKey("contributors.id"), index=True)
+
+    state = Column(String)  # approved, changes_requested, commented, dismissed
+    submitted_at = Column(DateTime, nullable=True)
+    # Latency in hours from PR creation to this review
+    latency_hours = Column(Float, nullable=True)
+
+    repository = relationship("Repository")
+    reviewer = relationship("Contributor")
+
+class Comment(Base):
+    """Issue / PR comment detail for responsiveness analytics."""
+    __tablename__ = "comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    github_id = Column(Integer, unique=True, index=True)
+    repository_id = Column(Integer, ForeignKey("repositories.id"), index=True)
+    issue_number = Column(Integer, nullable=True)
+    commenter_id = Column(Integer, ForeignKey("contributors.id"), index=True)
+    created_at = Column(DateTime, nullable=True)
+
+    repository = relationship("Repository")
+    commenter = relationship("Contributor")

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useRepo } from '@/context/RepoContext';
 import { repoService } from '@/services/api';
+import { formatDuration } from '@/lib/utils';
 import { Loader2, AlertTriangle, Clock, List, AlertCircle, CheckCircle2, Info } from 'lucide-react';
 
 const PRBottlenecks = () => {
@@ -56,7 +57,7 @@ const PRBottlenecks = () => {
                 />
                 <SummaryCard
                     title="Median Review Time"
-                    value={`${summary.median_review_hours}h`}
+                    value={formatDuration(summary.median_review_hours)}
                     icon={Clock}
                     desc="Time to first maintainer response"
                     color={summary.median_review_hours > 72 ? "text-red-500" : "text-emerald-500"}
@@ -169,7 +170,7 @@ const PRBottlenecks = () => {
                         <div className="pt-4 border-t">
                             <div className="flex items-center justify-between mb-1">
                                 <span className="text-sm font-medium">Median Review Time</span>
-                                <span className="text-xl font-bold">{first_time_prs.median_review_hours}h</span>
+                                <span className="text-xl font-bold">{formatDuration(first_time_prs.median_review_hours)}</span>
                             </div>
                             <div className="text-xs text-muted-foreground">For first-time contributors (All time).</div>
                             <div className="mt-2 text-xs flex gap-2">
