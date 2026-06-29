@@ -42,6 +42,26 @@ export const repoService = {
         return response.data;
     },
 
+    getActivityTimeline: async (id, days = 365) => {
+        const response = await api.get(`/repositories/${id}/activity-timeline?days=${days}`);
+        return response.data;
+    },
+
+    getLeaderboard: async (id, days = 365) => {
+        const response = await api.get(`/repositories/${id}/leaderboard?days=${days}`);
+        return response.data;
+    },
+
+    getReviewerLoad: async (id, days = 365) => {
+        const response = await api.get(`/repositories/${id}/reviewer-load?days=${days}`);
+        return response.data;
+    },
+
+    getNewcomerFunnel: async (id, days = 365) => {
+        const response = await api.get(`/repositories/${id}/newcomer-funnel?days=${days}`);
+        return response.data;
+    },
+
     getPRBottlenecks: async (id) => {
         const response = await api.get(`/repositories/${id}/pr-bottlenecks`);
         return response.data;
@@ -52,8 +72,8 @@ export const repoService = {
         return response.data;
     },
 
-    getPRReviewHealth: async (repoFullName) => {
-        const response = await api.get(`/health/pr-review?repo=${repoFullName}`);
+    getPRReviewHealth: async (repoFullName, days = 90) => {
+        const response = await api.get(`/health/pr-review?repo=${repoFullName}&days=${days}`);
         return response.data;
     },
 
@@ -62,6 +82,54 @@ export const repoService = {
             pr_title: prTitle,
             author_name: authorName,
             days_waiting: daysWaiting
+        });
+        return response.data;
+    },
+
+    // Issues Analytics Endpoints (6 new endpoints)
+    getIssueTriageLoad: async (id, days = 90) => {
+        const response = await api.get(`/repositories/${id}/issue-triage-load?days=${days}`);
+        return response.data;
+    },
+
+    getIssueWorkloadBalance: async (id) => {
+        const response = await api.get(`/repositories/${id}/issue-workload-balance`);
+        return response.data;
+    },
+
+    getIssueTrends: async (id, days = 90) => {
+        const response = await api.get(`/repositories/${id}/issue-trends?days=${days}`);
+        return response.data;
+    },
+
+    getFirstTimerIssueQueue: async (id) => {
+        const response = await api.get(`/repositories/${id}/first-timer-issue-queue`);
+        return response.data;
+    },
+
+    getZombieIssues: async (id) => {
+        const response = await api.get(`/repositories/${id}/zombie-issues`);
+        return response.data;
+    },
+
+    getIssueCategoryBreakdown: async (id) => {
+        const response = await api.get(`/repositories/${id}/issue-category-breakdown`);
+        return response.data;
+    },
+
+    // Bulk Operations Stubs
+    bulkMarkIssuesStale: async (id, issueNumbers, reason = "") => {
+        const response = await api.post(`/repositories/${id}/issues/bulk-mark-stale`, {
+            issue_numbers: issueNumbers,
+            reason
+        });
+        return response.data;
+    },
+
+    bulkCloseIssues: async (id, issueNumbers, reason = "") => {
+        const response = await api.post(`/repositories/${id}/issues/bulk-close`, {
+            issue_numbers: issueNumbers,
+            reason
         });
         return response.data;
     }
