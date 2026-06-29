@@ -749,15 +749,11 @@ class SignalEngine:
             print(f"ERROR calculating Issues health: {e}")
             return None
 
-    def compute_pr_review_health(self, repo_id: int) -> Dict[str, Any]:
+    def compute_pr_review_health(self, repo_id: int, days: int = 90) -> Dict[str, Any]:
         """
-        Calculates PR Review Health metrics:
-        1. Open PRs
-        2. Unreviewed PRs (Open & has_review=False)
-        3. PRs Waiting > 7 Days
-        4. Median Review Time
-        5. Attention Queue (Table of critical PRs)
-        6. Review Flow Insight
+        Calculates PR Review Health metrics with enhanced KPIs, trends, funnel, and alerts.
+        Backward-compatible: preserves existing `summary`, `attention_queue`, `review_flow` keys.
+        New keys: `kpis`, `trends`, `wait_distribution`, `funnel`, `alerts`.
         """
         now = datetime.utcnow()
         repo = self.db.query(Repository).get(repo_id)
@@ -765,93 +761,374 @@ class SignalEngine:
             return None
 
         try:
-            # --- 1. Basic Counts ---
+            # --- Window definitions ---
+            window_start = now - timedelta(days=days)
+            prior_start = now - timedelta(days=days * 2)
+            seven_days_ago = now - timedelta(days=7)
+            fourteen_days_ago = now - timedelta(days=14)
+
+            # --- 1. Basic Counts (existing, null-safe) ---
             open_prs = self.db.query(PullRequest).filter(
                 PullRequest.repository_id == repo_id,
                 PullRequest.state == 'open'
             ).all()
             open_prs_count = len(open_prs)
 
-            # --- 2. Unreviewed PRs (The Risk Metric) ---
-            # Proxy: Open AND has_review is False
             unreviewed_prs = [pr for pr in open_prs if not pr.has_review]
             unreviewed_count = len(unreviewed_prs)
 
-            # --- 3. Waiting > 7 Days ---
-            seven_days_ago = now - timedelta(days=7)
-            waiting_over_7d = [pr for pr in open_prs if pr.created_at < seven_days_ago]
+            waiting_over_7d = [pr for pr in open_prs if pr.created_at and pr.created_at < seven_days_ago]
             waiting_over_7d_count = len(waiting_over_7d)
 
-            # --- 4. Median Review Time ---
-            ninety_days_ago = now - timedelta(days=90)
-            reviewed_prs_90d = self.db.query(PullRequest).filter(
+            # --- 2. Median Review Time (within window) ---
+            reviewed_prs_window = self.db.query(PullRequest).filter(
                 PullRequest.repository_id == repo_id,
                 PullRequest.time_to_first_review != None,
-                PullRequest.created_at >= ninety_days_ago
+                PullRequest.created_at >= window_start
             ).all()
-            
-            review_times = [pr.time_to_first_review for pr in reviewed_prs_90d]
-            median_review_hours = statistics.median(review_times) if review_times else None
+            review_times = [pr.time_to_first_review for pr in reviewed_prs_window if pr.time_to_first_review is not None]
+            median_review_hours = round(statistics.median(review_times), 1) if review_times else None
 
-            # --- 5. Attention Queue (The Action Table) ---
-            # Unified list: Unreviewed first, then by age.
-            attention_queue = []
-            
+            # --- 3. NEW: Time-to-Merge ---
+            merged_prs_window = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.merged_at != None,
+                PullRequest.merged_at >= window_start,
+                PullRequest.created_at != None
+            ).all()
+
+            ttm_hours_current = []
+            for pr in merged_prs_window:
+                if pr.merged_at and pr.created_at:
+                    h = (pr.merged_at - pr.created_at).total_seconds() / 3600.0
+                    if h >= 0:
+                        ttm_hours_current.append(h)
+
+            time_to_merge_median = round(statistics.median(ttm_hours_current), 1) if ttm_hours_current else None
+            time_to_merge_mean = round(statistics.mean(ttm_hours_current), 1) if ttm_hours_current else None
+
+            merged_prs_prior = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.merged_at != None,
+                PullRequest.merged_at >= prior_start,
+                PullRequest.merged_at < window_start,
+                PullRequest.created_at != None
+            ).all()
+            ttm_hours_prior = []
+            for pr in merged_prs_prior:
+                if pr.merged_at and pr.created_at:
+                    h = (pr.merged_at - pr.created_at).total_seconds() / 3600.0
+                    if h >= 0:
+                        ttm_hours_prior.append(h)
+            time_to_merge_median_prior = statistics.median(ttm_hours_prior) if ttm_hours_prior else None
+            time_to_merge_delta = None
+            if time_to_merge_median is not None and time_to_merge_median_prior is not None and time_to_merge_median_prior != 0:
+                time_to_merge_delta = round(((time_to_merge_median - time_to_merge_median_prior) / time_to_merge_median_prior) * 100, 1)
+
+            # --- 4. NEW: Review Cycle Time ---
+            closed_prs_window = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.state != 'open',
+                PullRequest.closed_at != None,
+                PullRequest.closed_at >= window_start
+            ).all()
+
+            rct_hours_current = []
+            earliest_review_current = self._earliest_review_at_by_pr([pr.id for pr in closed_prs_window])
+            for pr in closed_prs_window:
+                end_dt = pr.merged_at or pr.closed_at
+                if not end_dt:
+                    continue
+                first_review_dt = earliest_review_current.get(pr.id)
+                if first_review_dt is None and pr.time_to_first_review is not None:
+                    first_review_dt = pr.created_at + timedelta(hours=pr.time_to_first_review)
+                elif first_review_dt is None:
+                    continue
+                h = (end_dt - first_review_dt).total_seconds() / 3600.0
+                if h >= 0:
+                    rct_hours_current.append(h)
+
+            review_cycle_time_median = round(statistics.median(rct_hours_current), 1) if rct_hours_current else None
+
+            closed_prs_prior = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.state != 'open',
+                PullRequest.closed_at != None,
+                PullRequest.closed_at >= prior_start,
+                PullRequest.closed_at < window_start
+            ).all()
+
+            rct_hours_prior = []
+            earliest_review_prior = self._earliest_review_at_by_pr([pr.id for pr in closed_prs_prior])
+            for pr in closed_prs_prior:
+                end_dt = pr.merged_at or pr.closed_at
+                if not end_dt:
+                    continue
+                first_review_dt = earliest_review_prior.get(pr.id)
+                if first_review_dt is None and pr.time_to_first_review is not None:
+                    first_review_dt = pr.created_at + timedelta(hours=pr.time_to_first_review)
+                elif first_review_dt is None:
+                    continue
+                h = (end_dt - first_review_dt).total_seconds() / 3600.0
+                if h >= 0:
+                    rct_hours_prior.append(h)
+
+            review_cycle_time_median_prior = statistics.median(rct_hours_prior) if rct_hours_prior else None
+            review_cycle_time_delta = None
+            if review_cycle_time_median is not None and review_cycle_time_median_prior is not None and review_cycle_time_median_prior != 0:
+                review_cycle_time_delta = round(((review_cycle_time_median - review_cycle_time_median_prior) / review_cycle_time_median_prior) * 100, 1)
+
+            # --- 5. NEW: Comment Density ---
+            prs_in_window = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.created_at >= window_start
+            ).all()
+
+            comment_density = None
+            comment_density_source = "reviews_count"
+            if prs_in_window:
+                pr_numbers_in_window = [pr.number for pr in prs_in_window if pr.number is not None]
+                if pr_numbers_in_window:
+                    comment_counts = {pr.id: 0 for pr in prs_in_window}
+                    num_to_prid = {pr.number: pr.id for pr in prs_in_window if pr.number is not None}
+                    rows = self.db.query(
+                        Comment.issue_number,
+                        func.count(Comment.id),
+                    ).filter(
+                        Comment.repository_id == repo_id,
+                        Comment.issue_number.in_(pr_numbers_in_window),
+                        Comment.created_at >= window_start,
+                    ).group_by(Comment.issue_number).all()
+                    for issue_number, cnt in rows:
+                        prid = num_to_prid.get(issue_number)
+                        if prid is not None:
+                            comment_counts[prid] = cnt
+
+                    if any(v > 0 for v in comment_counts.values()):
+                        comment_density_source = "comment_table"
+                        comment_density = round(sum(comment_counts.values()) / len(prs_in_window), 2)
+                    else:
+                        rc_values = [pr.reviews_count for pr in prs_in_window if pr.reviews_count is not None]
+                        if rc_values:
+                            comment_density = round(statistics.mean(rc_values), 2)
+
+            prs_in_prior = self.db.query(PullRequest).filter(
+                PullRequest.repository_id == repo_id,
+                PullRequest.created_at >= prior_start,
+                PullRequest.created_at < window_start
+            ).all()
+            comment_density_prior = None
+            if prs_in_prior:
+                if comment_density_source == "comment_table":
+                    prior_pr_numbers = [pr.number for pr in prs_in_prior if pr.number is not None]
+                    prior_comment_counts = []
+                    if prior_pr_numbers:
+                        rows = self.db.query(
+                            Comment.issue_number,
+                            func.count(Comment.id),
+                        ).filter(
+                            Comment.repository_id == repo_id,
+                            Comment.issue_number.in_(prior_pr_numbers),
+                            Comment.created_at >= prior_start,
+                            Comment.created_at < window_start,
+                        ).group_by(Comment.issue_number).all()
+                        counts_by_number = {n: c for n, c in rows}
+                        for pr in prs_in_prior:
+                            if pr.number is not None:
+                                prior_comment_counts.append(counts_by_number.get(pr.number, 0))
+                    if prior_comment_counts:
+                        comment_density_prior = sum(prior_comment_counts) / len(prs_in_prior)
+                else:
+                    rc_vals = [pr.reviews_count for pr in prs_in_prior if pr.reviews_count is not None]
+                    if rc_vals:
+                        comment_density_prior = statistics.mean(rc_vals)
+
+            comment_density_delta = None
+            if comment_density is not None and comment_density_prior is not None and comment_density_prior != 0:
+                comment_density_delta = round(((comment_density - comment_density_prior) / comment_density_prior) * 100, 1)
+
+            # --- 6. NEW: Trend Series (weekly buckets within window) ---
+            trend_series = []
+            import math
+            bucket_weeks = max(1, math.ceil(days / 7))
+            for i in range(bucket_weeks):
+                bucket_start = window_start + timedelta(weeks=i)
+                bucket_end = bucket_start + timedelta(weeks=1)
+                if bucket_start > now:
+                    break
+
+                bucket_merged = [pr for pr in merged_prs_window
+                                 if pr.merged_at and bucket_start <= pr.merged_at < bucket_end]
+                merged_count = len(bucket_merged)
+
+                bucket_ttm = []
+                for pr in bucket_merged:
+                    if pr.created_at:
+                        h = (pr.merged_at - pr.created_at).total_seconds() / 3600.0
+                        if h >= 0:
+                            bucket_ttm.append(h)
+
+                bucket_closed = [pr for pr in closed_prs_window
+                                 if pr.closed_at and bucket_start <= pr.closed_at < bucket_end]
+                bucket_rct = []
+                for pr in bucket_closed:
+                    end_dt = pr.merged_at or pr.closed_at
+                    if not end_dt:
+                        continue
+                    first_review_dt = earliest_review_current.get(pr.id)
+                    if first_review_dt is None and pr.time_to_first_review is not None:
+                        first_review_dt = pr.created_at + timedelta(hours=pr.time_to_first_review)
+                    elif first_review_dt is None:
+                        continue
+                    h = (end_dt - first_review_dt).total_seconds() / 3600.0
+                    if h >= 0:
+                        bucket_rct.append(h)
+
+                trend_series.append({
+                    "week_start": bucket_start.strftime("%Y-%m-%d"),
+                    "time_to_merge_hours": round(statistics.median(bucket_ttm), 1) if bucket_ttm else None,
+                    "review_cycle_hours": round(statistics.median(bucket_rct), 1) if bucket_rct else None,
+                    "merged_count": merged_count
+                })
+
+            # --- 7. NEW: Wait-time Distribution ---
+            wait_times = []
             for pr in open_prs:
-                age_days = (now - pr.created_at).days
+                if not pr.has_review and pr.created_at:
+                    wait_h = (now - pr.created_at).total_seconds() / 3600.0
+                    wait_times.append(wait_h)
+            for pr in reviewed_prs_window:
+                if pr.time_to_first_review is not None:
+                    wait_times.append(pr.time_to_first_review)
+
+            dist = {"0_2d": 0, "gt2_7d": 0, "gt7_14d": 0, "14d_plus": 0}
+            for h in wait_times:
+                d = h / 24.0
+                if d <= 2:
+                    dist["0_2d"] += 1
+                elif d <= 7:
+                    dist["gt2_7d"] += 1
+                elif d <= 14:
+                    dist["gt7_14d"] += 1
+                else:
+                    dist["14d_plus"] += 1
+
+            wait_distribution = [
+                {"bucket": "0–2d", "count": dist["0_2d"]},
+                {"bucket": ">2–7d", "count": dist["gt2_7d"]},
+                {"bucket": ">7–14d", "count": dist["gt7_14d"]},
+                {"bucket": "14d+", "count": dist["14d_plus"]},
+            ]
+
+            # --- 8. NEW: Review-stage Funnel ---
+            funnel_unreviewed = unreviewed_count
+
+            approved_states = {'approved', 'APPROVED'}
+            in_review_prs = 0
+            approved_prs = 0
+            reviewed_open_pr_ids = [pr.id for pr in open_prs if pr.has_review]
+            latest_review_state = self._latest_review_state_by_pr(reviewed_open_pr_ids)
+            for pr in open_prs:
+                if pr.has_review:
+                    state = latest_review_state.get(pr.id)
+                    if state in approved_states:
+                        approved_prs += 1
+                    else:
+                        in_review_prs += 1
+
+            funnel_merged = len(merged_prs_window)
+
+            funnel = [
+                {"stage": "Unreviewed", "count": funnel_unreviewed},
+                {"stage": "In Review", "count": in_review_prs},
+                {"stage": "Approved", "count": approved_prs},
+                {"stage": "Merged", "count": funnel_merged},
+            ]
+
+            # --- 9. NEW: Stale Alerts ---
+            critical_stale = []
+            warning_stale = []
+            for pr in open_prs:
+                if not pr.has_review and pr.created_at:
+                    age_d = (now - pr.created_at).days
+                    if age_d > 14:
+                        critical_stale.append(pr.number)
+                    elif age_d > 7:
+                        warning_stale.append(pr.number)
+
+            alerts = {
+                "critical_count": len(critical_stale),
+                "warning_count": len(warning_stale),
+                "stale_pr_numbers": critical_stale + warning_stale
+            }
+
+            # --- 10. Attention Queue (existing, enhanced with nudge fields and deep-links) ---
+            attention_queue = []
+            for pr in open_prs:
+                age_days = (now - pr.created_at).days if pr.created_at else 0
                 is_unreviewed = not pr.has_review
-                
-                # Status Logic
+
                 status = 'healthy'
                 if is_unreviewed:
-                    if age_days > 7: status = 'critical'
-                    else: status = 'warning' # Unreviewed is always at least a warning in this view? Or just heavily weighted.
-                    # Let's stick to Age-based status for consistency, but Unreviewed is the sort key.
+                    if age_days > 7:
+                        status = 'critical'
+                    else:
+                        status = 'warning'
                 else:
-                    if age_days > 14: status = 'critical'
-                    elif age_days > 7: status = 'warning'
+                    if age_days > 14:
+                        status = 'critical'
+                    elif age_days > 7:
+                        status = 'warning'
 
-                # Last Activity Proxy
-                last_activity = 'None' if is_unreviewed else 'Maintainer' # Simplification based on has_review
+                last_activity = 'None' if is_unreviewed else 'Maintainer'
+                base_url = f"https://github.com/{repo.owner}/{repo.name}/pull/{pr.number}"
 
                 attention_queue.append({
                     "number": pr.number,
-                    "title": pr.title,
+                    "title": pr.title or "",
                     "author": pr.author.login if pr.author else "unknown",
                     "age_days": age_days,
                     "last_activity": last_activity,
                     "status": status,
                     "is_unreviewed": is_unreviewed,
-                    "html_url": f"https://github.com/{repo.owner}/{repo.name}/pull/{pr.number}"
+                    "html_url": base_url,
+                    "files_url": f"{base_url}/files",
+                    "reviews_url": f"{base_url}/files#reviews",
                 })
 
-            # Sort: Unreviewed First (True > False), then Age Descending
-            attention_queue.sort(key=lambda x: (not x['is_unreviewed'], -x['age_days'])) # False < True, so not True (False) comes first? 
-            # Wait, True > False is 1 > 0. Descending sort puts True first. 
-            # Start with explicit tuple sort:
-            # Primary: is_unreviewed (True first) -> Reverse
-            # Secondary: age_days (High first) -> Reverse
             attention_queue.sort(key=lambda x: (x['is_unreviewed'], x['age_days']), reverse=True)
-            
-            # --- 6. Review Flow Insight ---
-            # Simple breakdown
-            waiting_for_first_review = unreviewed_count # Roughly same concept for this page
-            # "Near Merge" is hard to guess without CI status. 
-            # Let's use: Reviewed but not merged
+
+            # --- 11. Review Flow Insight (existing, backward-compatible) ---
             reviewed_open = open_prs_count - unreviewed_count
-            
+
             return {
+                # --- Existing keys (backward-compatible) ---
                 "summary": {
                     "open_prs": open_prs_count,
                     "unreviewed_prs": unreviewed_count,
                     "waiting_over_7d": waiting_over_7d_count,
-                    "median_review_hours": round(median_review_hours, 1) if median_review_hours is not None else None
+                    "median_review_hours": median_review_hours
                 },
                 "attention_queue": attention_queue,
                 "review_flow": {
-                    "waiting_for_first_review": waiting_for_first_review,
+                    "waiting_for_first_review": unreviewed_count,
                     "in_review_process": reviewed_open
-                }
+                },
+                # --- New keys ---
+                "kpis": {
+                    "time_to_merge_median_hours": time_to_merge_median,
+                    "time_to_merge_mean_hours": time_to_merge_mean,
+                    "time_to_merge_delta_pct": time_to_merge_delta,
+                    "review_cycle_time_median_hours": review_cycle_time_median,
+                    "review_cycle_time_delta_pct": review_cycle_time_delta,
+                    "comment_density": comment_density,
+                    "comment_density_delta_pct": comment_density_delta,
+                    "comment_density_source": comment_density_source,
+                },
+                "trends": trend_series,
+                "wait_distribution": wait_distribution,
+                "funnel": funnel,
+                "alerts": alerts,
             }
 
         except Exception as e:
