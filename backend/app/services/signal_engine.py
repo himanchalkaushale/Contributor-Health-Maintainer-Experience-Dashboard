@@ -161,6 +161,54 @@ class SignalEngine:
         leaderboard.sort(key=lambda x: x["total_contributions"], reverse=True)
         return {"leaderboard": leaderboard, "last_updated": repo.last_synced_at or now}
 
+    def compute_reviewer_load(self, repo_id: int, days: int = 365) -> Dict[str, Any]:
+        """Per reviewer: review count, median latency, share of total reviews."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(days=days)
+
+        reviews = self.db.query(Review).options(
+            joinedload(Review.reviewer)
+        ).filter(
+            Review.repository_id == repo_id,
+            Review.submitted_at >= window_start,
+        ).all()
+
+        agg = {}
+        total_reviews = 0
+        for rv in reviews:
+            reviewer = rv.reviewer
+            if not reviewer or _is_bot(reviewer.login):
+                continue
+            total_reviews += 1
+            row = agg.setdefault(reviewer.id, {
+                "login": reviewer.login, "avatar_url": reviewer.avatar_url,
+                "count": 0, "latencies": [],
+            })
+            row["count"] += 1
+            if rv.latency_hours is not None and rv.latency_hours >= 0:
+                row["latencies"].append(rv.latency_hours)
+
+        reviewers = []
+        for cid, r in agg.items():
+            median_latency = statistics.median(r["latencies"]) if r["latencies"] else None
+            reviewers.append({
+                "login": r["login"], "avatar_url": r["avatar_url"],
+                "reviews": r["count"],
+                "median_latency_hours": round(median_latency, 1) if median_latency is not None else None,
+                "share_percent": round(r["count"] / total_reviews * 100, 1) if total_reviews else 0,
+            })
+
+        reviewers.sort(key=lambda x: x["reviews"], reverse=True)
+        return {
+            "total_reviews": total_reviews,
+            "reviewers": reviewers,
+            "last_updated": repo.last_synced_at or now,
+        }
+
     def compute_contributors_health(self, repo_id: int) -> Dict[str, Any]:
         """
         Computes contributor health metrics based on STRICT "Real Contributor Logic":
