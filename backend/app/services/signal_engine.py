@@ -602,6 +602,19 @@ class SignalEngine:
             print(f"ERROR calculating PR bottlenecks: {e}")
             return None
 
+    @staticmethod
+    def _parse_labels(labels_snapshot: Optional[str]) -> List[str]:
+        """Safely parse the JSON labels snapshot into a list of label names."""
+        if not labels_snapshot:
+            return []
+        try:
+            labels = json.loads(labels_snapshot)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(labels, list):
+            return []
+        return [str(l) for l in labels]
+
     def compute_issues_health(self, repo_id: int) -> Dict[str, Any]:
         """
         Computes data for the Issues Page.
@@ -1535,6 +1548,99 @@ class SignalEngine:
         result["last_updated"] = repo.last_synced_at or now
 
         return result
+
+    def compute_first_timer_issue_queue(self, repo_id: int, max_items: int = 20) -> Dict[str, Any]:
+        """Priority queue of first-timer issues needing response - for first-timer outreach."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        twenty_four_hours_ago = now - timedelta(hours=24)
+        seven_days_ago = now - timedelta(days=7)
+
+        first_timers = self.db.query(Contributor).filter(
+            Contributor.first_contribution_date >= now - timedelta(days=30)
+        ).all()
+        first_timer_ids = {c.id for c in first_timers}
+
+        issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open",
+            Issue.has_maintainer_response == False,
+            Issue.author_id.in_(first_timer_ids),
+            Issue.created_at <= twenty_four_hours_ago
+        ).order_by(Issue.created_at).all()
+
+        scored_issues = []
+        for issue in issues:
+            age_hours = (now - issue.created_at).total_seconds() / 3600
+            labels = self._parse_labels(issue.labels_snapshot)
+
+            age_component = min(age_hours, 72)
+            first_timer_bonus = 100
+            bug_bonus = 50 if any("bug" in l.lower() for l in labels) else 0
+            score = age_component + first_timer_bonus + bug_bonus
+
+            author = issue.author
+            scored_issues.append({
+                "number": issue.number,
+                "title": issue.title,
+                "author_login": author.login if author else "unknown",
+                "author_avatar": author.avatar_url if author else None,
+                "age_hours": round(age_hours, 1),
+                "age_days": int(age_hours / 24),
+                "labels": labels,
+                "priority_score": round(score, 1),
+                "html_url": f"https://github.com/{repo.owner}/{repo.name}/issues/{issue.number}",
+                "critical": age_hours > 72
+            })
+
+        scored_issues.sort(key=lambda x: x["priority_score"], reverse=True)
+
+        return {
+            "queue": scored_issues[:max_items],
+            "total_count": len(scored_issues),
+            "critical_count": len([i for i in scored_issues if i["critical"]]),
+            "last_updated": repo.last_synced_at or now
+        }
+
+    def compute_zombie_issues(self, repo_id: int) -> Dict[str, Any]:
+        """Issues that got a response but were then abandoned - for buried in issues scenario."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        seven_days_ago = now - timedelta(days=7)
+
+        issues = self.db.query(Issue).filter(
+            Issue.repository_id == repo_id,
+            Issue.state == "open",
+            Issue.has_maintainer_response == True,
+            Issue.assignee_id == None,
+            Issue.updated_at < seven_days_ago
+        ).order_by(Issue.updated_at).all()
+
+        zombie_list = []
+        for issue in issues:
+            days_since_update = (now - issue.updated_at).days
+            zombie_list.append({
+                "number": issue.number,
+                "title": issue.title,
+                "author": issue.author.login if issue.author else "unknown",
+                "days_since_response": days_since_update,
+                "last_responder": issue.first_responder.login if issue.first_responder else "unknown",
+                "labels": self._parse_labels(issue.labels_snapshot),
+                "status": "critical" if days_since_update > 30 else ("warning" if days_since_update > 14 else "stale"),
+                "html_url": f"https://github.com/{repo.owner}/{repo.name}/issues/{issue.number}"
+            })
+
+        return {
+            "zombie_issues": zombie_list[:50],
+            "total_count": len(zombie_list),
+            "last_updated": repo.last_synced_at or now
+        }
 
     def _compute_stale_prs_signal(self, repo_id: int) -> Dict[str, Any]:
         return {} 
