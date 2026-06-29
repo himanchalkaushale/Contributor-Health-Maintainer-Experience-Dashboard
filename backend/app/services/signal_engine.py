@@ -103,6 +103,64 @@ class SignalEngine:
             "last_updated": repo.last_synced_at or now,
         }
 
+    def compute_leaderboard(self, repo_id: int, days: int = 365) -> Dict[str, Any]:
+        """Per-contributor PRs merged, reviews given, comments, commits, tenure."""
+        repo = self.db.query(Repository).get(repo_id)
+        if not repo:
+            return None
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(days=days)
+
+        events = self.db.query(ContributionEvent).options(
+            selectinload(ContributionEvent.contributor)
+        ).filter(
+            ContributionEvent.repository_id == repo_id,
+            ContributionEvent.event_at >= window_start,
+        ).all()
+
+        agg = {}  # cid -> stats
+        for ev in events:
+            c = ev.contributor
+            if not c or _is_bot(c.login) or not ev.event_at:
+                continue
+            row = agg.setdefault(c.id, {
+                "login": c.login, "avatar_url": c.avatar_url, "html_url": c.html_url,
+                "prs_opened": 0, "prs_merged": 0, "reviews": 0, "comments": 0,
+                "commits": 0, "first": ev.event_at, "last": ev.event_at,
+            })
+            dt = ev.event_at.replace(tzinfo=None)
+            if dt < row["first"]:
+                row["first"] = dt
+            if dt > row["last"]:
+                row["last"] = dt
+            if ev.event_type == "pr_opened":
+                row["prs_opened"] += 1
+            elif ev.event_type == "pr_merged":
+                row["prs_merged"] += 1
+            elif ev.event_type == "review_submitted":
+                row["reviews"] += 1
+            elif ev.event_type == "issue_comment":
+                row["comments"] += 1
+            elif ev.event_type == "commit":
+                row["commits"] += 1
+
+        leaderboard = []
+        for cid, r in agg.items():
+            first = r["first"].replace(tzinfo=None) if hasattr(r["first"], "replace") else r["first"]
+            last = r["last"].replace(tzinfo=None) if hasattr(r["last"], "replace") else r["last"]
+            tenure_days = max(0, (last - first).days)
+            total = r["prs_opened"] + r["prs_merged"] + r["reviews"] + r["comments"] + r["commits"]
+            leaderboard.append({
+                "login": r["login"], "avatar_url": r["avatar_url"], "html_url": r["html_url"],
+                "prs_opened": r["prs_opened"], "prs_merged": r["prs_merged"],
+                "reviews": r["reviews"], "comments": r["comments"], "commits": r["commits"],
+                "tenure_days": tenure_days, "total_contributions": total,
+            })
+
+        leaderboard.sort(key=lambda x: x["total_contributions"], reverse=True)
+        return {"leaderboard": leaderboard, "last_updated": repo.last_synced_at or now}
+
     def compute_contributors_health(self, repo_id: int) -> Dict[str, Any]:
         """
         Computes contributor health metrics based on STRICT "Real Contributor Logic":
