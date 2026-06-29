@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float, Text, Index, Table
 from sqlalchemy.orm import relationship
 from app.database import Base
 from datetime import datetime
@@ -104,3 +104,33 @@ class RepositoryStats(Base):
     active_contributors = Column(Integer, default=0)
     
     repository = relationship("Repository", back_populates="historical_stats")
+
+class ContributionEvent(Base):
+    """
+    Unified activity event table. One row per contribution action
+    (PR opened/merged/closed, review, issue opened/closed, comment, commit).
+    Powers the activity timeline, leaderboard, reviewer-load and newcomer analytics.
+    """
+    __tablename__ = "contribution_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    repository_id = Column(Integer, ForeignKey("repositories.id"), index=True)
+    contributor_id = Column(Integer, ForeignKey("contributors.id"), index=True)
+
+    # pr_opened, pr_merged, pr_closed, review_submitted,
+    # issue_opened, issue_closed, issue_comment, commit
+    event_type = Column(String, index=True)
+    event_at = Column(DateTime, index=True)
+
+    # GitHub id of the source object (PR/issue/review/comment/commit sha)
+    source_id = Column(String, nullable=True)
+    # Extra payload: review state, additions/deletions, pr number, etc.
+    meta = Column(Text, nullable=True)
+
+    repository = relationship("Repository")
+    contributor = relationship("Contributor")
+
+    __table_args__ = (
+        Index("ix_event_repo_time", "repository_id", "event_at"),
+        Index("ix_event_repo_contributor", "repository_id", "contributor_id"),
+    )
