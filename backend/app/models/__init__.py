@@ -134,3 +134,21 @@ class ContributionEvent(Base):
         Index("ix_event_repo_time", "repository_id", "event_at"),
         Index("ix_event_repo_contributor", "repository_id", "contributor_id"),
     )
+
+class Review(Base):
+    """PR review detail for reviewer-load and responsiveness analytics."""
+    __tablename__ = "reviews"
+
+    id = Column(Integer, primary_key=True, index=True)
+    github_id = Column(Integer, unique=True, index=True)
+    repository_id = Column(Integer, ForeignKey("repositories.id"), index=True)
+    pull_request_id = Column(Integer, ForeignKey("pull_requests.id"), nullable=True)
+    reviewer_id = Column(Integer, ForeignKey("contributors.id"), index=True)
+
+    state = Column(String)  # approved, changes_requested, commented, dismissed
+    submitted_at = Column(DateTime, nullable=True)
+    # Latency in hours from PR creation to this review
+    latency_hours = Column(Float, nullable=True)
+
+    repository = relationship("Repository")
+    reviewer = relationship("Contributor")
