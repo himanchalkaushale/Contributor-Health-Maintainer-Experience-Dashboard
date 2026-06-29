@@ -152,3 +152,17 @@ class Review(Base):
 
     repository = relationship("Repository")
     reviewer = relationship("Contributor")
+
+class Comment(Base):
+    """Issue / PR comment detail for responsiveness analytics."""
+    __tablename__ = "comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    github_id = Column(Integer, unique=True, index=True)
+    repository_id = Column(Integer, ForeignKey("repositories.id"), index=True)
+    issue_number = Column(Integer, nullable=True)
+    commenter_id = Column(Integer, ForeignKey("contributors.id"), index=True)
+    created_at = Column(DateTime, nullable=True)
+
+    repository = relationship("Repository")
+    commenter = relationship("Contributor")
