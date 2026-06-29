@@ -42,7 +42,9 @@ class Contributor(Base):
     
     # Relationships
     pull_requests = relationship("PullRequest", back_populates="author")
-    issues = relationship("Issue", back_populates="author")
+    authored_issues = relationship("Issue", foreign_keys="Issue.author_id", back_populates="author")
+    assigned_issues = relationship("Issue", foreign_keys="Issue.assignee_id", back_populates="assignee")
+    first_responded_issues = relationship("Issue", foreign_keys="Issue.first_responder_id", back_populates="first_responder")
 
 class PullRequest(Base):
     __tablename__ = "pull_requests"
@@ -94,7 +96,7 @@ class Label(Base):
 
 class Issue(Base):
     __tablename__ = "issues"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     github_id = Column(Integer, unique=True, index=True)
     number = Column(Integer)
@@ -103,17 +105,25 @@ class Issue(Base):
     created_at = Column(DateTime)
     updated_at = Column(DateTime)
     closed_at = Column(DateTime, nullable=True)
-    
+
     repository_id = Column(Integer, ForeignKey("repositories.id"))
     author_id = Column(Integer, ForeignKey("contributors.id"))
-    
+
+    # Assignee and workload tracking (Phase 1 of Issues Analytics)
+    assignee_id = Column(Integer, ForeignKey("contributors.id"), nullable=True)
+    first_responder_id = Column(Integer, ForeignKey("contributors.id"), nullable=True)
+    labels_snapshot = Column(Text, nullable=True)  # JSON string for fast LIKE queries
+
     # Analysis fields
     comments_count = Column(Integer, default=0)
     has_maintainer_response = Column(Boolean, default=False)
     time_to_first_response = Column(Float, nullable=True) # in hours
-    
+
     repository = relationship("Repository", back_populates="issues")
-    author = relationship("Contributor", back_populates="issues")
+    author = relationship("Contributor", foreign_keys=[author_id], back_populates="authored_issues")
+    assignee = relationship("Contributor", foreign_keys=[assignee_id], back_populates="assigned_issues")
+    first_responder = relationship("Contributor", foreign_keys=[first_responder_id], back_populates="first_responded_issues")
+    labels = relationship("Label", secondary=issue_labels, backref="issues")
 
 class RepositoryStats(Base):
     __tablename__ = "repository_stats"
