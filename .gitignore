@@ -5,3 +5,12 @@ __pycache__/
 .gemini/
 *.pyc
 .DS_Store
+
+# Local SQLite databases — never commit dev data
+*.db
+*.db-shm
+*.db-wal
+
+# Server logs
+*.log
+
